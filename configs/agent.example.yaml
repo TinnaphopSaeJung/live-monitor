@@ -1,0 +1,10 @@
+machine_id: "LIVE-PC-01"
+
+obs:
+  host: "127.0.0.1"
+  port: 4455
+  password: "PASSWORD_ที่ตั้งไว้ใน_OBS"
+  audio_input: "Mic/Aux"
+
+probe:
+  print_interval: "1s"
