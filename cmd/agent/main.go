@@ -9,11 +9,18 @@ import (
 	"os/signal"
 	"time"
 
+	"live-monitor/internal/agent/audio"
 	obsclient "live-monitor/internal/agent/obs"
 	"live-monitor/internal/config"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	configPath := flag.String(
 		"config",
 		"configs/agent.yaml",
@@ -24,14 +31,17 @@ func main() {
 
 	cfg, err := config.LoadAgent(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	printInterval, err := time.ParseDuration(
 		cfg.Probe.PrintInterval,
 	)
 	if err != nil {
-		log.Fatalf("parse print interval: %v", err)
+		return fmt.Errorf(
+			"parse print interval: %w",
+			err,
+		)
 	}
 
 	client, err := obsclient.New(
@@ -40,14 +50,16 @@ func main() {
 		cfg.OBS.Password,
 	)
 	if err != nil {
-		log.Fatalf("connect OBS: %v", err)
+		return fmt.Errorf("connect OBS: %w", err)
 	}
 	defer client.Close()
 
 	printLog("Connected to OBS")
 
-	if err := client.EnsureInput(cfg.OBS.AudioInput); err != nil {
-		log.Fatal(err)
+	if err := client.EnsureInput(
+		cfg.OBS.AudioInput,
+	); err != nil {
+		return err
 	}
 
 	printLog(
@@ -55,35 +67,68 @@ func main() {
 		cfg.OBS.AudioInput,
 	)
 
-	printLog(
-		"Listening to audio meter... (Ctrl+C to stop)",
-	)
-
-	ctx, stop := signal.NotifyContext( // สร้าง Context ที่จะถูก cancel เมื่อ program ได้รับ interrupt
+	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 	)
 	defer stop()
 
-	err = client.RunAudioProbe(
-		ctx,
-		cfg.OBS.AudioInput,
-		printInterval,
-		func(sample obsclient.AudioSample) {
-			printLog(
-				"%s level=%.1f dB muted=%t",
-				sample.InputName,
-				sample.LevelDB,
-				sample.Muted,
-			)
-		},
+	samples := make(chan audio.Sample, 64)
+	streamErr := make(chan error, 1)
+
+	go func() {
+		streamErr <- client.StreamAudioSamples(
+			ctx,
+			cfg.OBS.AudioInput,
+			samples,
+		)
+	}()
+
+	printLog(
+		"Audio sample stream started",
 	)
 
-	if err != nil {
-		log.Fatalf("audio probe stopped: %v", err)
-	}
+	ticker := time.NewTicker(printInterval)
+	defer ticker.Stop()
 
-	printLog("Agent stopped")
+	var latestSample audio.Sample
+	var hasSample bool
+
+	for {
+		select {
+
+		case <-ctx.Done():
+			printLog("Agent stopped")
+			return nil
+
+		case err := <-streamErr:
+			if err != nil {
+				return fmt.Errorf(
+					"audio sample stream stopped: %w",
+					err,
+				)
+			}
+
+			printLog("Agent stopped")
+			return nil
+
+		case sample := <-samples:
+			latestSample = sample
+			hasSample = true
+
+		case <-ticker.C:
+			if !hasSample {
+				continue
+			}
+
+			printLog(
+				"%s level=%.1f dB muted=%t",
+				latestSample.InputName,
+				latestSample.LevelDB,
+				latestSample.Muted,
+			)
+		}
+	}
 }
 
 func printLog(format string, args ...any) {

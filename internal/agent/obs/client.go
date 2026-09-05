@@ -15,19 +15,14 @@ import (
 	"github.com/andreykaipov/goobs/api/events"
 	"github.com/andreykaipov/goobs/api/events/subscriptions"
 	inputrequests "github.com/andreykaipov/goobs/api/requests/inputs"
+
+	"live-monitor/internal/agent/audio"
 )
 
 const meterFloorDB = -100.0
 
 type Client struct {
 	raw *goobs.Client
-}
-
-type AudioSample struct {
-	InputName string
-	LevelDB   float64
-	Muted     bool
-	Timestamp time.Time
 }
 
 func New(host string, port int, password string) (*Client, error) {
@@ -39,7 +34,6 @@ func New(host string, port int, password string) (*Client, error) {
 	client, err := goobs.New(
 		address,
 		goobs.WithPassword(password),
-
 		goobs.WithEventSubscriptions(
 			subscriptions.All|
 				subscriptions.InputVolumeMeters,
@@ -63,12 +57,16 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) EnsureInput(inputName string) error {
-	response, err := c.raw.Inputs.GetInputList() // ขอ input จาก obs (desktop audio, mic/aux, media source ect.)
+	response, err := c.raw.Inputs.GetInputList()
 	if err != nil {
 		return fmt.Errorf("get OBS input list: %w", err)
 	}
 
-	availableInputs := make([]string, 0, len(response.Inputs))
+	availableInputs := make(
+		[]string,
+		0,
+		len(response.Inputs),
+	)
 
 	for _, input := range response.Inputs {
 		availableInputs = append(
@@ -107,17 +105,15 @@ func (c *Client) GetMuteState(inputName string) (bool, error) {
 	return response.InputMuted, nil
 }
 
-func (c *Client) RunAudioProbe(
+func (c *Client) StreamAudioSamples(
 	ctx context.Context,
 	inputName string,
-	printInterval time.Duration,
-	onSample func(AudioSample),
+	out chan<- audio.Sample,
 ) error {
-	if printInterval <= 0 {
-		printInterval = time.Second
+	currentMuted, err := c.GetMuteState(inputName)
+	if err != nil {
+		return err
 	}
-
-	var lastPrint time.Time
 
 	for {
 		select {
@@ -129,38 +125,34 @@ func (c *Client) RunAudioProbe(
 				return errors.New("OBS event stream closed")
 			}
 
-			volumeEvent, ok := event.(*events.InputVolumeMeters)
-			if !ok {
-				continue
-			}
+			switch event := event.(type) {
 
-			for _, input := range volumeEvent.Inputs {
-				if input.Name != inputName {
+			case *events.InputMuteStateChanged:
+				if event.InputName != inputName {
 					continue
 				}
 
-				if !lastPrint.IsZero() && // เราต้องการแค่ 1 ครั้ง / วินาที
-					time.Since(lastPrint) < printInterval {
-					continue
+				currentMuted = event.InputMuted
+
+			case *events.InputVolumeMeters:
+				for _, input := range event.Inputs {
+					if input.Name != inputName {
+						continue
+					}
+
+					sample := audio.Sample{
+						InputName: inputName,
+						LevelDB:   peakDB(input.Levels),
+						Muted:     currentMuted,
+						Timestamp: time.Now(),
+					}
+
+					select {
+					case out <- sample:
+					case <-ctx.Done():
+						return nil
+					}
 				}
-
-				levelDB := peakDB(input.Levels) // แปลงค่าเสียงจาก obs เป็น dB
-
-				muted, err := c.GetMuteState(inputName)
-				if err != nil {
-					return err
-				}
-
-				now := time.Now()
-
-				onSample(AudioSample{
-					InputName: inputName,
-					LevelDB:   levelDB,
-					Muted:     muted,
-					Timestamp: now,
-				})
-
-				lastPrint = now
 			}
 		}
 	}
