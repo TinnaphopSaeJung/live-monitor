@@ -8,3 +8,8 @@ obs:
 
 probe:
   print_interval: "1s"
+
+audio:
+  silence_threshold_db: -60
+  signal_loss_duration: "10s"
+  recovery_duration: "5s"

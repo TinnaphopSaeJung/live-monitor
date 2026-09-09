@@ -25,7 +25,11 @@ type Client struct {
 	raw *goobs.Client
 }
 
-func New(host string, port int, password string) (*Client, error) {
+func New(
+	host string,
+	port int,
+	password string,
+) (*Client, error) {
 	address := net.JoinHostPort(
 		host,
 		strconv.Itoa(port),
@@ -56,10 +60,15 @@ func (c *Client) Close() error {
 	return c.raw.Disconnect()
 }
 
-func (c *Client) EnsureInput(inputName string) error {
+func (c *Client) EnsureInput(
+	inputName string,
+) error {
 	response, err := c.raw.Inputs.GetInputList()
 	if err != nil {
-		return fmt.Errorf("get OBS input list: %w", err)
+		return fmt.Errorf(
+			"get OBS input list: %w",
+			err,
+		)
 	}
 
 	availableInputs := make(
@@ -88,7 +97,9 @@ func (c *Client) EnsureInput(inputName string) error {
 	)
 }
 
-func (c *Client) GetMuteState(inputName string) (bool, error) {
+func (c *Client) GetMuteState(
+	inputName string,
+) (bool, error) {
 	params := inputrequests.
 		NewGetInputMuteParams().
 		WithInputName(inputName)
@@ -110,22 +121,31 @@ func (c *Client) StreamAudioSamples(
 	inputName string,
 	out chan<- audio.Sample,
 ) error {
-	currentMuted, err := c.GetMuteState(inputName)
+	currentMuted, err := c.GetMuteState(
+		inputName,
+	)
 	if err != nil {
 		return err
 	}
 
 	for {
 		select {
+
 		case <-ctx.Done():
 			return nil
 
 		case event, ok := <-c.raw.IncomingEvents:
 			if !ok {
-				return errors.New("OBS event stream closed")
+				return errors.New(
+					"OBS event stream closed",
+				)
 			}
 
 			switch event := event.(type) {
+
+			// ------------------------------------------
+			// Mute state changed
+			// ------------------------------------------
 
 			case *events.InputMuteStateChanged:
 				if event.InputName != inputName {
@@ -134,21 +154,32 @@ func (c *Client) StreamAudioSamples(
 
 				currentMuted = event.InputMuted
 
+			// ------------------------------------------
+			// Audio meter event
+			// ------------------------------------------
+
 			case *events.InputVolumeMeters:
 				for _, input := range event.Inputs {
 					if input.Name != inputName {
 						continue
 					}
 
+					levelDB, signalPresent := peakLevel(
+						input.Levels,
+					)
+
 					sample := audio.Sample{
-						InputName: inputName,
-						LevelDB:   peakDB(input.Levels),
-						Muted:     currentMuted,
-						Timestamp: time.Now(),
+						InputName:     inputName,
+						LevelDB:       levelDB,
+						SignalPresent: signalPresent,
+						Muted:         currentMuted,
+						Timestamp:     time.Now(),
 					}
 
 					select {
+
 					case out <- sample:
+
 					case <-ctx.Done():
 						return nil
 					}
@@ -158,7 +189,9 @@ func (c *Client) StreamAudioSamples(
 	}
 }
 
-func peakDB(levels [][3]float64) float64 {
+func peakLevel(
+	levels [][3]float64,
+) (float64, bool) {
 	var maxPeak float64
 
 	for _, channel := range levels {
@@ -170,8 +203,10 @@ func peakDB(levels [][3]float64) float64 {
 	}
 
 	if maxPeak <= 0 {
-		return meterFloorDB
+		return meterFloorDB, false
 	}
 
-	return 20 * math.Log10(maxPeak)
+	levelDB := 20 * math.Log10(maxPeak)
+
+	return levelDB, true
 }
