@@ -11,7 +11,6 @@ import (
 type AgentConfig struct {
 	MachineID string      `yaml:"machine_id"`
 	OBS       OBSConfig   `yaml:"obs"`
-	Probe     ProbeConfig `yaml:"probe"`
 	Audio     AudioConfig `yaml:"audio"`
 }
 
@@ -22,13 +21,14 @@ type OBSConfig struct {
 	AudioInput string `yaml:"audio_input"`
 }
 
-type ProbeConfig struct {
-	PrintInterval string `yaml:"print_interval"`
-}
-
 type AudioConfig struct {
 	SignalLossDuration string `yaml:"signal_loss_duration"`
-	RecoveryDuration   string `yaml:"recovery_duration"`
+
+	LowLevelThresholdDB    float64 `yaml:"low_level_threshold_db"`
+	LowLevelDuration       string  `yaml:"low_level_duration"`
+	LowLevelWindowDuration string  `yaml:"low_level_window_duration"`
+
+	RecoveryDuration string `yaml:"recovery_duration"`
 }
 
 func LoadAgent(path string) (*AgentConfig, error) {
@@ -49,6 +49,10 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		)
 	}
 
+	// --------------------------------------------------
+	// Defaults
+	// --------------------------------------------------
+
 	if cfg.OBS.Host == "" {
 		cfg.OBS.Host = "127.0.0.1"
 	}
@@ -57,17 +61,29 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		cfg.OBS.Port = 4455
 	}
 
-	if cfg.Probe.PrintInterval == "" {
-		cfg.Probe.PrintInterval = "1s"
-	}
-
 	if cfg.Audio.SignalLossDuration == "" {
 		cfg.Audio.SignalLossDuration = "10s"
+	}
+
+	if cfg.Audio.LowLevelThresholdDB == 0 {
+		cfg.Audio.LowLevelThresholdDB = -60
+	}
+
+	if cfg.Audio.LowLevelDuration == "" {
+		cfg.Audio.LowLevelDuration = "10s"
+	}
+
+	if cfg.Audio.LowLevelWindowDuration == "" {
+		cfg.Audio.LowLevelWindowDuration = "1s"
 	}
 
 	if cfg.Audio.RecoveryDuration == "" {
 		cfg.Audio.RecoveryDuration = "5s"
 	}
+
+	// --------------------------------------------------
+	// Validation
+	// --------------------------------------------------
 
 	if cfg.MachineID == "" {
 		return nil, fmt.Errorf(
@@ -81,16 +97,29 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		)
 	}
 
-	if err := validateDuration(
-		"probe.print_interval",
-		cfg.Probe.PrintInterval,
-	); err != nil {
-		return nil, err
+	if cfg.Audio.LowLevelThresholdDB >= 0 {
+		return nil, fmt.Errorf(
+			"audio.low_level_threshold_db must be below 0 dB",
+		)
 	}
 
 	if err := validateDuration(
 		"audio.signal_loss_duration",
 		cfg.Audio.SignalLossDuration,
+	); err != nil {
+		return nil, err
+	}
+
+	if err := validateDuration(
+		"audio.low_level_duration",
+		cfg.Audio.LowLevelDuration,
+	); err != nil {
+		return nil, err
+	}
+
+	if err := validateDuration(
+		"audio.low_level_window_duration",
+		cfg.Audio.LowLevelWindowDuration,
 	); err != nil {
 		return nil, err
 	}

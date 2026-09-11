@@ -3,13 +3,14 @@ machine_id: "LIVE-PC-01"
 obs:
   host: "127.0.0.1"
   port: 4455
-  password: "PASSWORD_ที่ตั้งไว้ใน_OBS"
+  password: "YOUR_PASSWORD"
   audio_input: "Mic/Aux"
 
-probe:
-  print_interval: "1s"
-
 audio:
-  silence_threshold_db: -60
   signal_loss_duration: "10s"
+
+  low_level_threshold_db: -60
+  low_level_duration: "10s"
+  low_level_window_duration: "1s"
+
   recovery_duration: "5s"

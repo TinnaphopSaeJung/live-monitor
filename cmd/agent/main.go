@@ -22,6 +22,10 @@ func main() {
 }
 
 func run() error {
+	// --------------------------------------------------
+	// 1. Command-line flags
+	// --------------------------------------------------
+
 	configPath := flag.String(
 		"config",
 		"configs/agent.yaml",
@@ -29,6 +33,10 @@ func run() error {
 	)
 
 	flag.Parse()
+
+	// --------------------------------------------------
+	// 2. Load config
+	// --------------------------------------------------
 
 	cfg, err := config.LoadAgent(*configPath)
 	if err != nil {
@@ -38,15 +46,9 @@ func run() error {
 		)
 	}
 
-	printInterval, err := time.ParseDuration(
-		cfg.Probe.PrintInterval,
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"parse print interval: %w",
-			err,
-		)
-	}
+	// --------------------------------------------------
+	// 3. Parse durations
+	// --------------------------------------------------
 
 	signalLossDuration, err := time.ParseDuration(
 		cfg.Audio.SignalLossDuration,
@@ -54,6 +56,26 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf(
 			"parse signal loss duration: %w",
+			err,
+		)
+	}
+
+	lowLevelDuration, err := time.ParseDuration(
+		cfg.Audio.LowLevelDuration,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"parse low level duration: %w",
+			err,
+		)
+	}
+
+	lowLevelWindowDuration, err := time.ParseDuration(
+		cfg.Audio.LowLevelWindowDuration,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"parse low level window duration: %w",
 			err,
 		)
 	}
@@ -68,6 +90,10 @@ func run() error {
 		)
 	}
 
+	// --------------------------------------------------
+	// 4. Create Signal Loss Detector
+	// --------------------------------------------------
+
 	signalLossDetector, err := detector.NewSignalLossDetector(
 		detector.Config{
 			SignalLossDuration: signalLossDuration,
@@ -80,6 +106,28 @@ func run() error {
 			err,
 		)
 	}
+
+	// --------------------------------------------------
+	// 5. Create Low Level Detector
+	// --------------------------------------------------
+
+	lowLevelDetector, err := detector.NewLowLevelDetector(
+		detector.LowLevelConfig{
+			ThresholdDB:      cfg.Audio.LowLevelThresholdDB,
+			LowLevelDuration: lowLevelDuration,
+			RecoveryDuration: recoveryDuration,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"create low level detector: %w",
+			err,
+		)
+	}
+
+	// --------------------------------------------------
+	// 6. Connect OBS
+	// --------------------------------------------------
 
 	client, err := obsclient.New(
 		cfg.OBS.Host,
@@ -96,6 +144,10 @@ func run() error {
 
 	printLog("Connected to OBS")
 
+	// --------------------------------------------------
+	// 7. Ensure target input exists
+	// --------------------------------------------------
+
 	if err := client.EnsureInput(
 		cfg.OBS.AudioInput,
 	); err != nil {
@@ -107,11 +159,19 @@ func run() error {
 		cfg.OBS.AudioInput,
 	)
 
+	// --------------------------------------------------
+	// 8. Graceful shutdown
+	// --------------------------------------------------
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 	)
 	defer stop()
+
+	// --------------------------------------------------
+	// 9. Audio Sample Pipeline
+	// --------------------------------------------------
 
 	samples := make(
 		chan audio.Sample,
@@ -141,20 +201,47 @@ func run() error {
 		recoveryDuration,
 	)
 
-	ticker := time.NewTicker(
-		printInterval,
+	printLog(
+		"Low level detector threshold=%.1f dB duration=%s window=%s recovery=%s",
+		cfg.Audio.LowLevelThresholdDB,
+		lowLevelDuration,
+		lowLevelWindowDuration,
+		recoveryDuration,
 	)
-	defer ticker.Stop()
+
+	// --------------------------------------------------
+	// 10. Low Level Window
+	// --------------------------------------------------
+
+	windowAggregator := audio.NewLevelWindowAggregator(
+		time.Now(),
+	)
+
+	windowTicker := time.NewTicker(
+		lowLevelWindowDuration,
+	)
+	defer windowTicker.Stop()
 
 	var latestSample audio.Sample
-	var hasSample bool
+
+	// --------------------------------------------------
+	// 11. Main Event Loop
+	// --------------------------------------------------
 
 	for {
 		select {
 
+		// ==============================================
+		// Shutdown
+		// ==============================================
+
 		case <-ctx.Done():
 			printLog("Agent stopped")
 			return nil
+
+		// ==============================================
+		// OBS Audio Stream Error
+		// ==============================================
 
 		case err := <-streamErr:
 			if err != nil {
@@ -167,21 +254,30 @@ func run() error {
 			printLog("Agent stopped")
 			return nil
 
+		// ==============================================
+		// Raw Audio Sample
+		// ==============================================
+
 		case sample := <-samples:
 			latestSample = sample
-			hasSample = true
 
-			result := signalLossDetector.Process(
+			// ------------------------------------------
+			// Signal Loss Detector
+			//
+			// ยังคงใช้ Raw Sample ~50ms
+			// ------------------------------------------
+
+			signalResult := signalLossDetector.Process(
 				sample,
 			)
 
-			switch result.Transition {
+			switch signalResult.Transition {
 
 			case detector.TransitionSignalLost:
 				printLog(
 					"AUDIO SIGNAL LOST level=%.1f dB no_signal_for=%s",
 					sample.LevelDB,
-					result.LossDuration.Round(
+					signalResult.LossDuration.Round(
 						time.Millisecond,
 					),
 				)
@@ -190,27 +286,106 @@ func run() error {
 				printLog(
 					"AUDIO SIGNAL RECOVERED level=%.1f dB incident_for=%s total_loss=%s",
 					sample.LevelDB,
-					result.IncidentDuration.Round(
+					signalResult.IncidentDuration.Round(
 						time.Millisecond,
 					),
-					result.LossDuration.Round(
+					signalResult.LossDuration.Round(
 						time.Millisecond,
 					),
 				)
 			}
 
-		case <-ticker.C:
-			if !hasSample {
+			// ------------------------------------------
+			// ส่ง Raw Sample เข้า Window Aggregator
+			// ------------------------------------------
+
+			windowAggregator.Add(
+				sample,
+			)
+
+		// ==============================================
+		// 1-second Level Window complete
+		// ==============================================
+
+		case tickAt := <-windowTicker.C:
+			window := windowAggregator.Flush(
+				tickAt,
+			)
+
+			// ------------------------------------------
+			// Low Level Detector
+			//
+			// ตอนนี้รับ 1 Window / second
+			// ไม่ได้รับ raw 50ms sample แล้ว
+			// ------------------------------------------
+
+			lowLevelResult := lowLevelDetector.Process(
+				window,
+			)
+
+			switch lowLevelResult.Transition {
+
+			case detector.LowLevelTransitionTooLow:
+				printLog(
+					"AUDIO LEVEL TOO LOW level=%.1f dB threshold=%.1f dB low_for=%s",
+					window.MaxDB,
+					cfg.Audio.LowLevelThresholdDB,
+					lowLevelResult.LowLevelDuration.Round(
+						time.Millisecond,
+					),
+				)
+
+			case detector.LowLevelTransitionRecovered:
+				printLog(
+					"AUDIO LEVEL RECOVERED level=%.1f dB incident_for=%s total_low=%s",
+					window.MaxDB,
+					lowLevelResult.IncidentDuration.Round(
+						time.Millisecond,
+					),
+					lowLevelResult.LowLevelDuration.Round(
+						time.Millisecond,
+					),
+				)
+			}
+
+			// ------------------------------------------
+			// Terminal Output
+			//
+			// ใช้ Window เดียวกับที่ Detector ใช้
+			// ------------------------------------------
+
+			if window.SampleCount == 0 {
+				printLog(
+					"%s no audio samples signal_state=%s level_state=%s",
+					cfg.OBS.AudioInput,
+					signalLossDetector.State(),
+					lowLevelDetector.State(),
+				)
+
+				continue
+			}
+
+			if window.UsableSampleCount == 0 {
+				printLog(
+					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s",
+					cfg.OBS.AudioInput,
+					latestSample.SignalPresent,
+					latestSample.Muted,
+					signalLossDetector.State(),
+					lowLevelDetector.State(),
+				)
+
 				continue
 			}
 
 			printLog(
-				"%s level=%.1f dB signal=%t muted=%t state=%s",
-				latestSample.InputName,
-				latestSample.LevelDB,
+				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s",
+				cfg.OBS.AudioInput,
+				window.MaxDB,
 				latestSample.SignalPresent,
 				latestSample.Muted,
 				signalLossDetector.State(),
+				lowLevelDetector.State(),
 			)
 		}
 	}
