@@ -125,6 +125,12 @@ func run() error {
 		)
 	}
 
+	// ==========================================
+	// Mute Detector
+	// ==========================================
+
+	muteDetector := detector.NewMuteDetector()
+
 	// --------------------------------------------------
 	// 6. Connect OBS
 	// --------------------------------------------------
@@ -160,6 +166,55 @@ func run() error {
 	)
 
 	// --------------------------------------------------
+	// Track Routing Probe
+	// --------------------------------------------------
+
+	routing, err := client.GetTrackRouting(
+		cfg.OBS.AudioInput,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"track routing probe: %w",
+			err,
+		)
+	}
+
+	printLog(
+		"Track routing input=%s tracks=%v output_mode=%s stream_track=%d valid=%t",
+		routing.InputName,
+		routing.InputTracks,
+		routing.OutputMode,
+		routing.StreamTrack,
+		routing.Valid,
+	)
+
+	trackRoutingDetector, err := detector.NewTrackRoutingDetector(
+		detector.TrackRoutingConfig{
+			StreamTrack: routing.StreamTrack,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"create track routing detector: %w",
+			err,
+		)
+	}
+
+	initialRoutingResult := trackRoutingDetector.Process(
+		routing.InputTracks,
+	)
+
+	if initialRoutingResult.Transition ==
+		detector.TrackRoutingTransitionInvalid {
+
+		printLog(
+			"AUDIO ROUTING INVALID stream_track=%d input_tracks=%v",
+			initialRoutingResult.StreamTrack,
+			initialRoutingResult.InputTracks,
+		)
+	}
+
+	// --------------------------------------------------
 	// 8. Graceful shutdown
 	// --------------------------------------------------
 
@@ -178,21 +233,27 @@ func run() error {
 		64,
 	)
 
-	streamErr := make(
+	routingEvents := make(
+		chan obsclient.TrackRoutingEvent,
+		8,
+	)
+
+	eventErr := make(
 		chan error,
 		1,
 	)
 
 	go func() {
-		streamErr <- client.StreamAudioSamples(
+		eventErr <- client.DispatchEvents(
 			ctx,
 			cfg.OBS.AudioInput,
 			samples,
+			routingEvents,
 		)
 	}()
 
 	printLog(
-		"Audio sample stream started",
+		"OBS event dispatcher started",
 	)
 
 	printLog(
@@ -239,14 +300,14 @@ func run() error {
 			printLog("Agent stopped")
 			return nil
 
-		// ==============================================
-		// OBS Audio Stream Error
-		// ==============================================
+			// ==============================================
+			// OBS Audio Stream Error
+			// ==============================================
 
-		case err := <-streamErr:
+		case err := <-eventErr:
 			if err != nil {
 				return fmt.Errorf(
-					"audio sample stream stopped: %w",
+					"OBS event dispatcher stopped: %w",
 					err,
 				)
 			}
@@ -260,6 +321,30 @@ func run() error {
 
 		case sample := <-samples:
 			latestSample = sample
+
+			// ==========================================
+			// Mute Detector
+			// ==========================================
+
+			muteResult := muteDetector.Process(
+				sample,
+			)
+
+			switch muteResult.Transition {
+
+			case detector.MuteTransitionMuted:
+				printLog(
+					"AUDIO MUTED",
+				)
+
+			case detector.MuteTransitionUnmuted:
+				printLog(
+					"AUDIO UNMUTED muted_for=%s",
+					muteResult.MutedDuration.Round(
+						time.Millisecond,
+					),
+				)
+			}
 
 			// ------------------------------------------
 			// Signal Loss Detector
@@ -302,6 +387,28 @@ func run() error {
 			windowAggregator.Add(
 				sample,
 			)
+
+		case routingEvent := <-routingEvents:
+			routingResult := trackRoutingDetector.Process(
+				routingEvent.InputTracks,
+			)
+
+			switch routingResult.Transition {
+
+			case detector.TrackRoutingTransitionInvalid:
+				printLog(
+					"AUDIO ROUTING INVALID stream_track=%d input_tracks=%v",
+					routingResult.StreamTrack,
+					routingResult.InputTracks,
+				)
+
+			case detector.TrackRoutingTransitionRecovered:
+				printLog(
+					"AUDIO ROUTING RECOVERED stream_track=%d input_tracks=%v",
+					routingResult.StreamTrack,
+					routingResult.InputTracks,
+				)
+			}
 
 		// ==============================================
 		// 1-second Level Window complete
@@ -356,10 +463,12 @@ func run() error {
 
 			if window.SampleCount == 0 {
 				printLog(
-					"%s no audio samples signal_state=%s level_state=%s",
+					"%s no audio samples signal_state=%s level_state=%s mute_state=%s routing_state=%s",
 					cfg.OBS.AudioInput,
 					signalLossDetector.State(),
 					lowLevelDetector.State(),
+					muteDetector.State(),
+					trackRoutingDetector.State(),
 				)
 
 				continue
@@ -367,25 +476,29 @@ func run() error {
 
 			if window.UsableSampleCount == 0 {
 				printLog(
-					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s",
+					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s",
 					cfg.OBS.AudioInput,
 					latestSample.SignalPresent,
 					latestSample.Muted,
 					signalLossDetector.State(),
 					lowLevelDetector.State(),
+					muteDetector.State(),
+					trackRoutingDetector.State(),
 				)
 
 				continue
 			}
 
 			printLog(
-				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s",
+				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s",
 				cfg.OBS.AudioInput,
 				window.MaxDB,
 				latestSample.SignalPresent,
 				latestSample.Muted,
 				signalLossDetector.State(),
 				lowLevelDetector.State(),
+				muteDetector.State(),
+				trackRoutingDetector.State(),
 			)
 		}
 	}
