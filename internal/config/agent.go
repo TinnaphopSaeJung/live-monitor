@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -9,9 +10,9 @@ import (
 )
 
 type AgentConfig struct {
-	MachineID string      `yaml:"machine_id"`
-	OBS       OBSConfig   `yaml:"obs"`
-	Audio     AudioConfig `yaml:"audio"`
+	Agent AgentInfoConfig `yaml:"agent"`
+	OBS   OBSConfig       `yaml:"obs"`
+	Audio AudioConfig     `yaml:"audio"`
 }
 
 type OBSConfig struct {
@@ -29,6 +30,11 @@ type AudioConfig struct {
 	LowLevelWindowDuration string  `yaml:"low_level_window_duration"`
 
 	RecoveryDuration string `yaml:"recovery_duration"`
+}
+
+type AgentInfoConfig struct {
+	MachineID         string `yaml:"machine_id"`
+	HeartbeatInterval string `yaml:"heartbeat_interval"`
 }
 
 func LoadAgent(path string) (*AgentConfig, error) {
@@ -81,13 +87,26 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		cfg.Audio.RecoveryDuration = "5s"
 	}
 
+	if cfg.Agent.HeartbeatInterval == "" {
+		cfg.Agent.HeartbeatInterval = "5s"
+	}
+
 	// --------------------------------------------------
 	// Validation
 	// --------------------------------------------------
 
-	if cfg.MachineID == "" {
+	if cfg.Agent.MachineID == "" {
+		return nil, errors.New(
+			"agent.machine_id is required",
+		)
+	}
+
+	if _, err := time.ParseDuration(
+		cfg.Agent.HeartbeatInterval,
+	); err != nil {
 		return nil, fmt.Errorf(
-			"machine_id is required",
+			"invalid agent.heartbeat_interval: %w",
+			err,
 		)
 	}
 

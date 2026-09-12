@@ -1,4 +1,6 @@
-machine_id: "LIVE-PC-01"
+agent:
+  machine_id: "LIVE-PC-01"
+  heartbeat_interval: "5s"
 
 obs:
   host: "127.0.0.1"

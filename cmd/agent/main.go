@@ -14,7 +14,9 @@ import (
 	"live-monitor/internal/agent/incident"
 	"live-monitor/internal/agent/monitor"
 	obsclient "live-monitor/internal/agent/obs"
+	"live-monitor/internal/agent/reporter"
 	"live-monitor/internal/config"
+	"live-monitor/internal/contracts"
 )
 
 func main() {
@@ -51,6 +53,16 @@ func run() error {
 	// --------------------------------------------------
 	// 3. Parse durations
 	// --------------------------------------------------
+
+	heartbeatInterval, err := time.ParseDuration(
+		cfg.Agent.HeartbeatInterval,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"parse heartbeat interval: %w",
+			err,
+		)
+	}
 
 	signalLossDuration, err := time.ParseDuration(
 		cfg.Audio.SignalLossDuration,
@@ -93,7 +105,7 @@ func run() error {
 	}
 
 	// --------------------------------------------------
-	// 4. Create Signal Loss Detector
+	// 4. Create detectors
 	// --------------------------------------------------
 
 	signalLossDetector, err := detector.NewSignalLossDetector(
@@ -109,10 +121,6 @@ func run() error {
 		)
 	}
 
-	// --------------------------------------------------
-	// 5. Create Low Level Detector
-	// --------------------------------------------------
-
 	lowLevelDetector, err := detector.NewLowLevelDetector(
 		detector.LowLevelConfig{
 			ThresholdDB:      cfg.Audio.LowLevelThresholdDB,
@@ -127,14 +135,10 @@ func run() error {
 		)
 	}
 
-	// --------------------------------------------------
-	// 6. Create Mute Detector
-	// --------------------------------------------------
-
 	muteDetector := detector.NewMuteDetector()
 
 	// --------------------------------------------------
-	// 7. Connect OBS
+	// 5. Connect OBS
 	// --------------------------------------------------
 
 	client, err := obsclient.New(
@@ -153,7 +157,7 @@ func run() error {
 	printLog("Connected to OBS")
 
 	// --------------------------------------------------
-	// 8. Ensure target audio input exists
+	// 6. Ensure audio input exists
 	// --------------------------------------------------
 
 	if err := client.EnsureInput(
@@ -168,7 +172,7 @@ func run() error {
 	)
 
 	// --------------------------------------------------
-	// 9. Initial Streaming State
+	// 7. Initial Streaming State
 	// --------------------------------------------------
 
 	streamStatus, err := client.GetStreamStatus()
@@ -193,7 +197,7 @@ func run() error {
 	)
 
 	// --------------------------------------------------
-	// 10. Initial Track Routing
+	// 8. Initial Track Routing
 	// --------------------------------------------------
 
 	routing, err := client.GetTrackRouting(
@@ -216,7 +220,7 @@ func run() error {
 	)
 
 	// --------------------------------------------------
-	// 11. Create Track Routing Detector
+	// 9. Track Routing Detector
 	// --------------------------------------------------
 
 	trackRoutingDetector, err := detector.NewTrackRoutingDetector(
@@ -246,16 +250,38 @@ func run() error {
 	}
 
 	// --------------------------------------------------
-	// 12. Incident Manager
+	// 10. Graceful shutdown context
+	//
+	// ต้องสร้างก่อน reconcileIncidents
+	// เพราะ Reporter จะใช้ ctx
+	// --------------------------------------------------
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+	)
+	defer stop()
+
+	// --------------------------------------------------
+	// 11. Incident Manager
 	// --------------------------------------------------
 
 	incidentManager := incident.NewManager()
 
 	// --------------------------------------------------
+	// 12. Reporter
+	//
+	// ตอนนี้ใช้ LogReporter
+	// ต่อไปเปลี่ยนเป็น HTTPReporter ได้
+	// --------------------------------------------------
+
+	agentReporter := reporter.NewLogReporter()
+
+	// --------------------------------------------------
 	// 13. Current Health Snapshot
 	//
-	// Incident layer ไม่สนใจว่า transition เกิดเมื่อไร
-	// แต่สนใจว่า "ตอนนี้" Detector แต่ละตัวอยู่ state อะไร
+	// อ่าน Current State ของ Detector
+	// ไม่ได้อาศัยเฉพาะ transition
 	// --------------------------------------------------
 
 	currentHealth := func() incident.HealthSnapshot {
@@ -275,16 +301,76 @@ func run() error {
 	}
 
 	// --------------------------------------------------
-	// 14. Incident Reconciliation
+	// 14. Build Heartbeat
+	// --------------------------------------------------
+
+	buildHeartbeat := func(
+		at time.Time,
+	) contracts.Heartbeat {
+		activeTypes := incidentManager.ActiveTypes()
+
+		activeIncidents := make(
+			[]string,
+			0,
+			len(activeTypes),
+		)
+
+		for _, incidentType := range activeTypes {
+			activeIncidents = append(
+				activeIncidents,
+				string(incidentType),
+			)
+		}
+
+		return contracts.Heartbeat{
+			MachineID: cfg.Agent.MachineID,
+			SentAt:    at,
+
+			OBSConnected: true,
+
+			StreamState: string(
+				monitoringContext.StreamingState(),
+			),
+
+			MonitoringActive: monitoringContext.MonitoringEnabled(),
+
+			Audio: contracts.AudioHealth{
+				SignalState: string(
+					signalLossDetector.State(),
+				),
+
+				LevelState: string(
+					lowLevelDetector.State(),
+				),
+
+				MuteState: string(
+					muteDetector.State(),
+				),
+
+				RoutingState: string(
+					trackRoutingDetector.State(),
+				),
+			},
+
+			ActiveIncidents: activeIncidents,
+		}
+	}
+
+	// --------------------------------------------------
+	// 15. Incident Reconciliation
 	//
-	// Detector State
+	// Detector States
 	//       +
 	// Monitoring Context
 	//       ↓
-	// OPEN / RESOLVE Incident
+	// IncidentManager
+	//       ↓
+	// Reporter
 	// --------------------------------------------------
 
-	reconcileIncidents := func(at time.Time) {
+	reconcileIncidents := func(
+		at time.Time,
+	) {
 		events := incidentManager.Reconcile(
 			monitoringContext.MonitoringEnabled(),
 			currentHealth(),
@@ -310,29 +396,33 @@ func run() error {
 					),
 				)
 			}
+
+			// ------------------------------------------
+			// Report Incident Event
+			// ------------------------------------------
+
+			if err := agentReporter.SendIncident(
+				ctx,
+				event,
+			); err != nil {
+				printLog(
+					"REPORT INCIDENT FAILED: %v",
+					err,
+				)
+			}
 		}
 	}
 
 	// --------------------------------------------------
-	// 15. Reconcile initial state
+	// 16. Reconcile initial state
 	//
-	// สำคัญในกรณี Agent start ขณะที่ OBS Streaming
-	// และ routing ผิดอยู่ก่อนแล้ว
+	// เช่น Agent start ตอนที่ OBS Streaming
+	// และ Routing ผิดอยู่ก่อนแล้ว
 	// --------------------------------------------------
 
 	reconcileIncidents(
 		time.Now(),
 	)
-
-	// --------------------------------------------------
-	// 16. Graceful shutdown context
-	// --------------------------------------------------
-
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-	)
-	defer stop()
 
 	// --------------------------------------------------
 	// 17. Event Channels
@@ -361,8 +451,7 @@ func run() error {
 	// --------------------------------------------------
 	// 18. OBS Event Dispatcher
 	//
-	// Dispatcher เป็น consumer เดียวของ
-	// c.raw.IncomingEvents
+	// เป็น consumer เดียวของ IncomingEvents
 	// --------------------------------------------------
 
 	go func() {
@@ -393,6 +482,12 @@ func run() error {
 		recoveryDuration,
 	)
 
+	printLog(
+		"Heartbeat machine=%s interval=%s",
+		cfg.Agent.MachineID,
+		heartbeatInterval,
+	)
+
 	// --------------------------------------------------
 	// 19. Low Level Window Aggregator
 	// --------------------------------------------------
@@ -406,10 +501,23 @@ func run() error {
 	)
 	defer windowTicker.Stop()
 
+	// --------------------------------------------------
+	// 20. Heartbeat Ticker
+	// --------------------------------------------------
+
+	heartbeatTicker := time.NewTicker(
+		heartbeatInterval,
+	)
+	defer heartbeatTicker.Stop()
+
+	// --------------------------------------------------
+	// Latest raw sample
+	// --------------------------------------------------
+
 	var latestSample audio.Sample
 
 	// --------------------------------------------------
-	// 20. Main Event Loop
+	// 21. Main Event Loop
 	// --------------------------------------------------
 
 	for {
@@ -508,9 +616,7 @@ func run() error {
 			}
 
 			// ------------------------------------------
-			// Incident reconciliation
-			//
-			// Mute / Signal state อาจเปลี่ยนจาก sample นี้
+			// Mute / Signal states อาจเปลี่ยน
 			// ------------------------------------------
 
 			reconcileIncidents(
@@ -518,7 +624,7 @@ func run() error {
 			)
 
 			// ------------------------------------------
-			// Add raw sample to 1-second Low Level Window
+			// Add sample to 1-second window
 			// ------------------------------------------
 
 			windowAggregator.Add(
@@ -551,7 +657,6 @@ func run() error {
 				)
 			}
 
-			// Routing health changed
 			reconcileIncidents(
 				routingEvent.Timestamp,
 			)
@@ -577,10 +682,9 @@ func run() error {
 			// ------------------------------------------
 			// สำคัญ:
 			//
-			// ตอน Stream เปลี่ยนเป็น STREAMING
-			// เราต้อง inspect Detector states ที่มีอยู่แล้ว
-			//
-			// เช่น AUDIO_TOO_LOW เกิดก่อนเริ่ม Live
+			// ถ้า Detector มีปัญหาตั้งแต่ก่อน Live
+			// เมื่อ Stream กลายเป็น STREAMING
+			// Incident จะถูกเปิดตรงนี้
 			// ------------------------------------------
 
 			reconcileIncidents(
@@ -588,7 +692,7 @@ func run() error {
 			)
 
 		// ==============================================
-		// Low Level 1-second Window
+		// Low Level Window Tick
 		// ==============================================
 
 		case tickAt := <-windowTicker.C:
@@ -630,7 +734,7 @@ func run() error {
 			}
 
 			// ------------------------------------------
-			// Low Level state อาจเปลี่ยน
+			// LowLevel state อาจเปลี่ยน
 			// ------------------------------------------
 
 			reconcileIncidents(
@@ -683,6 +787,25 @@ func run() error {
 				trackRoutingDetector.State(),
 				monitoringContext.StreamingState(),
 			)
+
+		// ==============================================
+		// Heartbeat
+		// ==============================================
+
+		case heartbeatAt := <-heartbeatTicker.C:
+			heartbeat := buildHeartbeat(
+				heartbeatAt,
+			)
+
+			if err := agentReporter.SendHeartbeat(
+				ctx,
+				heartbeat,
+			); err != nil {
+				printLog(
+					"REPORT HEARTBEAT FAILED: %v",
+					err,
+				)
+			}
 		}
 	}
 }

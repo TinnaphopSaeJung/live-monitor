@@ -203,3 +203,24 @@ var orderedIncidentTypes = []Type{
 	TypeAudioTooLow,
 	TypeRoutingInvalid,
 }
+
+func (m *Manager) ActiveTypes() []Type {
+	active := make(
+		[]Type,
+		0,
+		len(m.active),
+	)
+
+	for _, incidentType := range orderedIncidentTypes {
+		if _, exists := m.active[incidentType]; !exists {
+			continue
+		}
+
+		active = append(
+			active,
+			incidentType,
+		)
+	}
+
+	return active
+}
