@@ -3,7 +3,6 @@ package reporter
 import (
 	"context"
 
-	"live-monitor/internal/agent/incident"
 	"live-monitor/internal/contracts"
 )
 
@@ -15,6 +14,6 @@ type Reporter interface {
 
 	SendIncident(
 		ctx context.Context,
-		event incident.Event,
+		event contracts.IncidentEvent,
 	) error
 }

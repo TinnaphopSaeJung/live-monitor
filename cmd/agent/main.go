@@ -356,6 +356,38 @@ func run() error {
 		}
 	}
 
+	buildIncidentEvent := func(
+		event incident.Event,
+	) contracts.IncidentEvent {
+		payload := contracts.IncidentEvent{
+			MachineID: cfg.Agent.MachineID,
+
+			EventType: string(
+				event.EventType,
+			),
+
+			IncidentType: string(
+				event.IncidentType,
+			),
+
+			StartedAt:  event.StartedAt,
+			OccurredAt: event.OccurredAt,
+		}
+
+		if event.EventType == incident.EventResolved {
+			reason := string(
+				event.ResolutionReason,
+			)
+
+			durationMS := event.Duration.Milliseconds()
+
+			payload.ResolutionReason = &reason
+			payload.DurationMS = &durationMS
+		}
+
+		return payload
+	}
+
 	// --------------------------------------------------
 	// 15. Incident Reconciliation
 	//
@@ -401,9 +433,13 @@ func run() error {
 			// Report Incident Event
 			// ------------------------------------------
 
+			payload := buildIncidentEvent(
+				event,
+			)
+
 			if err := agentReporter.SendIncident(
 				ctx,
-				event,
+				payload,
 			); err != nil {
 				printLog(
 					"REPORT INCIDENT FAILED: %v",

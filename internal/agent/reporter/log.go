@@ -3,8 +3,8 @@ package reporter
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"live-monitor/internal/agent/incident"
 	"live-monitor/internal/contracts"
 )
 
@@ -31,14 +31,33 @@ func (r *LogReporter) SendHeartbeat(
 
 func (r *LogReporter) SendIncident(
 	_ context.Context,
-	event incident.Event,
+	event contracts.IncidentEvent,
 ) error {
+	if event.ResolutionReason == nil {
+		fmt.Printf(
+			"[REPORT] INCIDENT machine=%s event=%s type=%s started_at=%s\n",
+			event.MachineID,
+			event.EventType,
+			event.IncidentType,
+			event.StartedAt.Format(time.RFC3339),
+		)
+
+		return nil
+	}
+
+	durationMS := int64(0)
+
+	if event.DurationMS != nil {
+		durationMS = *event.DurationMS
+	}
+
 	fmt.Printf(
-		"[REPORT] INCIDENT event=%s type=%s reason=%s duration=%s\n",
+		"[REPORT] INCIDENT machine=%s event=%s type=%s reason=%s duration_ms=%d\n",
+		event.MachineID,
 		event.EventType,
 		event.IncidentType,
-		event.ResolutionReason,
-		event.Duration,
+		*event.ResolutionReason,
+		durationMS,
 	)
 
 	return nil
