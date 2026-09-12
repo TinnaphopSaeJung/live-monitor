@@ -11,6 +11,7 @@ import (
 
 	"live-monitor/internal/agent/audio"
 	"live-monitor/internal/agent/detector"
+	"live-monitor/internal/agent/incident"
 	"live-monitor/internal/agent/monitor"
 	obsclient "live-monitor/internal/agent/obs"
 	"live-monitor/internal/config"
@@ -126,14 +127,14 @@ func run() error {
 		)
 	}
 
-	// ==========================================
-	// Mute Detector
-	// ==========================================
+	// --------------------------------------------------
+	// 6. Create Mute Detector
+	// --------------------------------------------------
 
 	muteDetector := detector.NewMuteDetector()
 
 	// --------------------------------------------------
-	// 6. Connect OBS
+	// 7. Connect OBS
 	// --------------------------------------------------
 
 	client, err := obsclient.New(
@@ -152,7 +153,7 @@ func run() error {
 	printLog("Connected to OBS")
 
 	// --------------------------------------------------
-	// 7. Ensure target input exists
+	// 8. Ensure target audio input exists
 	// --------------------------------------------------
 
 	if err := client.EnsureInput(
@@ -165,6 +166,10 @@ func run() error {
 		"Input found: %s",
 		cfg.OBS.AudioInput,
 	)
+
+	// --------------------------------------------------
+	// 9. Initial Streaming State
+	// --------------------------------------------------
 
 	streamStatus, err := client.GetStreamStatus()
 	if err != nil {
@@ -188,7 +193,7 @@ func run() error {
 	)
 
 	// --------------------------------------------------
-	// Track Routing Probe
+	// 10. Initial Track Routing
 	// --------------------------------------------------
 
 	routing, err := client.GetTrackRouting(
@@ -209,6 +214,10 @@ func run() error {
 		routing.StreamTrack,
 		routing.Valid,
 	)
+
+	// --------------------------------------------------
+	// 11. Create Track Routing Detector
+	// --------------------------------------------------
 
 	trackRoutingDetector, err := detector.NewTrackRoutingDetector(
 		detector.TrackRoutingConfig{
@@ -237,7 +246,86 @@ func run() error {
 	}
 
 	// --------------------------------------------------
-	// 8. Graceful shutdown
+	// 12. Incident Manager
+	// --------------------------------------------------
+
+	incidentManager := incident.NewManager()
+
+	// --------------------------------------------------
+	// 13. Current Health Snapshot
+	//
+	// Incident layer ไม่สนใจว่า transition เกิดเมื่อไร
+	// แต่สนใจว่า "ตอนนี้" Detector แต่ละตัวอยู่ state อะไร
+	// --------------------------------------------------
+
+	currentHealth := func() incident.HealthSnapshot {
+		return incident.HealthSnapshot{
+			AudioTooLow: lowLevelDetector.State() ==
+				detector.LowLevelStateTooLow,
+
+			Muted: muteDetector.State() ==
+				detector.MuteStateMuted,
+
+			SignalLost: signalLossDetector.State() ==
+				detector.StateSignalLost,
+
+			RoutingInvalid: trackRoutingDetector.State() ==
+				detector.TrackRoutingStateInvalid,
+		}
+	}
+
+	// --------------------------------------------------
+	// 14. Incident Reconciliation
+	//
+	// Detector State
+	//       +
+	// Monitoring Context
+	//       ↓
+	// OPEN / RESOLVE Incident
+	// --------------------------------------------------
+
+	reconcileIncidents := func(at time.Time) {
+		events := incidentManager.Reconcile(
+			monitoringContext.MonitoringEnabled(),
+			currentHealth(),
+			at,
+		)
+
+		for _, event := range events {
+			switch event.EventType {
+
+			case incident.EventOpened:
+				printLog(
+					"INCIDENT OPENED type=%s",
+					event.IncidentType,
+				)
+
+			case incident.EventResolved:
+				printLog(
+					"INCIDENT RESOLVED type=%s reason=%s duration=%s",
+					event.IncidentType,
+					event.ResolutionReason,
+					event.Duration.Round(
+						time.Millisecond,
+					),
+				)
+			}
+		}
+	}
+
+	// --------------------------------------------------
+	// 15. Reconcile initial state
+	//
+	// สำคัญในกรณี Agent start ขณะที่ OBS Streaming
+	// และ routing ผิดอยู่ก่อนแล้ว
+	// --------------------------------------------------
+
+	reconcileIncidents(
+		time.Now(),
+	)
+
+	// --------------------------------------------------
+	// 16. Graceful shutdown context
 	// --------------------------------------------------
 
 	ctx, stop := signal.NotifyContext(
@@ -247,7 +335,7 @@ func run() error {
 	defer stop()
 
 	// --------------------------------------------------
-	// 9. Audio Sample Pipeline
+	// 17. Event Channels
 	// --------------------------------------------------
 
 	samples := make(
@@ -269,6 +357,13 @@ func run() error {
 		chan error,
 		1,
 	)
+
+	// --------------------------------------------------
+	// 18. OBS Event Dispatcher
+	//
+	// Dispatcher เป็น consumer เดียวของ
+	// c.raw.IncomingEvents
+	// --------------------------------------------------
 
 	go func() {
 		eventErr <- client.DispatchEvents(
@@ -299,7 +394,7 @@ func run() error {
 	)
 
 	// --------------------------------------------------
-	// 10. Low Level Window
+	// 19. Low Level Window Aggregator
 	// --------------------------------------------------
 
 	windowAggregator := audio.NewLevelWindowAggregator(
@@ -314,7 +409,7 @@ func run() error {
 	var latestSample audio.Sample
 
 	// --------------------------------------------------
-	// 11. Main Event Loop
+	// 20. Main Event Loop
 	// --------------------------------------------------
 
 	for {
@@ -325,12 +420,15 @@ func run() error {
 		// ==============================================
 
 		case <-ctx.Done():
-			printLog("Agent stopped")
+			printLog(
+				"Agent stopped",
+			)
+
 			return nil
 
-			// ==============================================
-			// OBS Audio Stream Error
-			// ==============================================
+		// ==============================================
+		// OBS Event Dispatcher Error
+		// ==============================================
 
 		case err := <-eventErr:
 			if err != nil {
@@ -340,7 +438,10 @@ func run() error {
 				)
 			}
 
-			printLog("Agent stopped")
+			printLog(
+				"Agent stopped",
+			)
+
 			return nil
 
 		// ==============================================
@@ -350,9 +451,9 @@ func run() error {
 		case sample := <-samples:
 			latestSample = sample
 
-			// ==========================================
+			// ------------------------------------------
 			// Mute Detector
-			// ==========================================
+			// ------------------------------------------
 
 			muteResult := muteDetector.Process(
 				sample,
@@ -376,8 +477,6 @@ func run() error {
 
 			// ------------------------------------------
 			// Signal Loss Detector
-			//
-			// ยังคงใช้ Raw Sample ~50ms
 			// ------------------------------------------
 
 			signalResult := signalLossDetector.Process(
@@ -409,12 +508,26 @@ func run() error {
 			}
 
 			// ------------------------------------------
-			// ส่ง Raw Sample เข้า Window Aggregator
+			// Incident reconciliation
+			//
+			// Mute / Signal state อาจเปลี่ยนจาก sample นี้
+			// ------------------------------------------
+
+			reconcileIncidents(
+				sample.Timestamp,
+			)
+
+			// ------------------------------------------
+			// Add raw sample to 1-second Low Level Window
 			// ------------------------------------------
 
 			windowAggregator.Add(
 				sample,
 			)
+
+		// ==============================================
+		// Track Routing Changed
+		// ==============================================
 
 		case routingEvent := <-routingEvents:
 			routingResult := trackRoutingDetector.Process(
@@ -438,6 +551,15 @@ func run() error {
 				)
 			}
 
+			// Routing health changed
+			reconcileIncidents(
+				routingEvent.Timestamp,
+			)
+
+		// ==============================================
+		// Streaming State Changed
+		// ==============================================
+
 		case streamEvent := <-streamEvents:
 			update := monitoringContext.ApplyStreamEvent(
 				streamEvent.Active,
@@ -452,8 +574,21 @@ func run() error {
 				monitoringContext.MonitoringEnabled(),
 			)
 
+			// ------------------------------------------
+			// สำคัญ:
+			//
+			// ตอน Stream เปลี่ยนเป็น STREAMING
+			// เราต้อง inspect Detector states ที่มีอยู่แล้ว
+			//
+			// เช่น AUDIO_TOO_LOW เกิดก่อนเริ่ม Live
+			// ------------------------------------------
+
+			reconcileIncidents(
+				streamEvent.Timestamp,
+			)
+
 		// ==============================================
-		// 1-second Level Window complete
+		// Low Level 1-second Window
 		// ==============================================
 
 		case tickAt := <-windowTicker.C:
@@ -463,9 +598,6 @@ func run() error {
 
 			// ------------------------------------------
 			// Low Level Detector
-			//
-			// ตอนนี้รับ 1 Window / second
-			// ไม่ได้รับ raw 50ms sample แล้ว
 			// ------------------------------------------
 
 			lowLevelResult := lowLevelDetector.Process(
@@ -498,9 +630,15 @@ func run() error {
 			}
 
 			// ------------------------------------------
-			// Terminal Output
-			//
-			// ใช้ Window เดียวกับที่ Detector ใช้
+			// Low Level state อาจเปลี่ยน
+			// ------------------------------------------
+
+			reconcileIncidents(
+				window.EndAt,
+			)
+
+			// ------------------------------------------
+			// Terminal Status
 			// ------------------------------------------
 
 			if window.SampleCount == 0 {
