@@ -18,11 +18,18 @@ type TrackRoutingEvent struct {
 	Timestamp   time.Time
 }
 
+type StreamStateEvent struct {
+	Active    bool
+	State     string
+	Timestamp time.Time
+}
+
 func (c *Client) DispatchEvents(
 	ctx context.Context,
 	inputName string,
 	audioOut chan<- audio.Sample,
 	routingOut chan<- TrackRoutingEvent,
+	streamOut chan<- StreamStateEvent,
 ) error {
 	// --------------------------------------------------
 	// Initial mute state
@@ -114,6 +121,20 @@ func (c *Client) DispatchEvents(
 
 				select {
 				case routingOut <- update:
+
+				case <-ctx.Done():
+					return nil
+				}
+
+			case *events.StreamStateChanged:
+				update := StreamStateEvent{
+					Active:    event.OutputActive,
+					State:     event.OutputState,
+					Timestamp: time.Now(),
+				}
+
+				select {
+				case streamOut <- update:
 
 				case <-ctx.Done():
 					return nil

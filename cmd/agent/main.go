@@ -11,6 +11,7 @@ import (
 
 	"live-monitor/internal/agent/audio"
 	"live-monitor/internal/agent/detector"
+	"live-monitor/internal/agent/monitor"
 	obsclient "live-monitor/internal/agent/obs"
 	"live-monitor/internal/config"
 )
@@ -165,6 +166,27 @@ func run() error {
 		cfg.OBS.AudioInput,
 	)
 
+	streamStatus, err := client.GetStreamStatus()
+	if err != nil {
+		return fmt.Errorf(
+			"stream state probe: %w",
+			err,
+		)
+	}
+
+	monitoringContext := monitor.NewContext(
+		streamStatus.Active,
+		streamStatus.Reconnecting,
+	)
+
+	printLog(
+		"Streaming status active=%t reconnecting=%t state=%s monitoring=%t",
+		streamStatus.Active,
+		streamStatus.Reconnecting,
+		monitoringContext.StreamingState(),
+		monitoringContext.MonitoringEnabled(),
+	)
+
 	// --------------------------------------------------
 	// Track Routing Probe
 	// --------------------------------------------------
@@ -238,6 +260,11 @@ func run() error {
 		8,
 	)
 
+	streamEvents := make(
+		chan obsclient.StreamStateEvent,
+		8,
+	)
+
 	eventErr := make(
 		chan error,
 		1,
@@ -249,6 +276,7 @@ func run() error {
 			cfg.OBS.AudioInput,
 			samples,
 			routingEvents,
+			streamEvents,
 		)
 	}()
 
@@ -410,6 +438,20 @@ func run() error {
 				)
 			}
 
+		case streamEvent := <-streamEvents:
+			update := monitoringContext.ApplyStreamEvent(
+				streamEvent.Active,
+				streamEvent.State,
+			)
+
+			printLog(
+				"STREAM STATE CHANGED active=%t obs_state=%s state=%s monitoring=%t",
+				streamEvent.Active,
+				streamEvent.State,
+				update.CurrentState,
+				monitoringContext.MonitoringEnabled(),
+			)
+
 		// ==============================================
 		// 1-second Level Window complete
 		// ==============================================
@@ -463,12 +505,13 @@ func run() error {
 
 			if window.SampleCount == 0 {
 				printLog(
-					"%s no audio samples signal_state=%s level_state=%s mute_state=%s routing_state=%s",
+					"%s no audio samples signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 					cfg.OBS.AudioInput,
 					signalLossDetector.State(),
 					lowLevelDetector.State(),
 					muteDetector.State(),
 					trackRoutingDetector.State(),
+					monitoringContext.StreamingState(),
 				)
 
 				continue
@@ -476,7 +519,7 @@ func run() error {
 
 			if window.UsableSampleCount == 0 {
 				printLog(
-					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s",
+					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 					cfg.OBS.AudioInput,
 					latestSample.SignalPresent,
 					latestSample.Muted,
@@ -484,13 +527,14 @@ func run() error {
 					lowLevelDetector.State(),
 					muteDetector.State(),
 					trackRoutingDetector.State(),
+					monitoringContext.StreamingState(),
 				)
 
 				continue
 			}
 
 			printLog(
-				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s",
+				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 				cfg.OBS.AudioInput,
 				window.MaxDB,
 				latestSample.SignalPresent,
@@ -499,6 +543,7 @@ func run() error {
 				lowLevelDetector.State(),
 				muteDetector.State(),
 				trackRoutingDetector.State(),
+				monitoringContext.StreamingState(),
 			)
 		}
 	}
