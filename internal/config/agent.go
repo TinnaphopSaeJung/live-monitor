@@ -10,9 +10,10 @@ import (
 )
 
 type AgentConfig struct {
-	Agent AgentInfoConfig `yaml:"agent"`
-	OBS   OBSConfig       `yaml:"obs"`
-	Audio AudioConfig     `yaml:"audio"`
+	Agent   AgentInfoConfig `yaml:"agent"`
+	Backend BackendConfig   `yaml:"backend"`
+	OBS     OBSConfig       `yaml:"obs"`
+	Audio   AudioConfig     `yaml:"audio"`
 }
 
 type OBSConfig struct {
@@ -35,6 +36,13 @@ type AudioConfig struct {
 type AgentInfoConfig struct {
 	MachineID         string `yaml:"machine_id"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"`
+}
+
+type BackendConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	BaseURL        string `yaml:"base_url"`
+	AgentToken     string `yaml:"agent_token"`
+	RequestTimeout string `yaml:"request_timeout"`
 }
 
 func LoadAgent(path string) (*AgentConfig, error) {
@@ -91,6 +99,10 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		cfg.Agent.HeartbeatInterval = "5s"
 	}
 
+	if cfg.Backend.RequestTimeout == "" {
+		cfg.Backend.RequestTimeout = "2s"
+	}
+
 	// --------------------------------------------------
 	// Validation
 	// --------------------------------------------------
@@ -108,6 +120,29 @@ func LoadAgent(path string) (*AgentConfig, error) {
 			"invalid agent.heartbeat_interval: %w",
 			err,
 		)
+	}
+
+	if cfg.Backend.Enabled {
+		if cfg.Backend.BaseURL == "" {
+			return nil, errors.New(
+				"backend.base_url is required",
+			)
+		}
+
+		if cfg.Backend.AgentToken == "" {
+			return nil, errors.New(
+				"backend.agent_token is required",
+			)
+		}
+
+		if _, err := time.ParseDuration(
+			cfg.Backend.RequestTimeout,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"invalid backend.request_timeout: %w",
+				err,
+			)
+		}
 	}
 
 	if cfg.OBS.AudioInput == "" {

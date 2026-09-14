@@ -9,6 +9,9 @@ import (
 	"os/signal"
 	"time"
 
+	"crypto/sha256"
+	"encoding/hex"
+
 	"live-monitor/internal/agent/audio"
 	"live-monitor/internal/agent/detector"
 	"live-monitor/internal/agent/incident"
@@ -102,6 +105,20 @@ func run() error {
 			"parse recovery duration: %w",
 			err,
 		)
+	}
+
+	var backendRequestTimeout time.Duration
+
+	if cfg.Backend.Enabled {
+		backendRequestTimeout, err = time.ParseDuration(
+			cfg.Backend.RequestTimeout,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"parse backend request timeout: %w",
+				err,
+			)
+		}
 	}
 
 	// --------------------------------------------------
@@ -275,7 +292,50 @@ func run() error {
 	// ต่อไปเปลี่ยนเป็น HTTPReporter ได้
 	// --------------------------------------------------
 
-	agentReporter := reporter.NewLogReporter()
+	var agentReporter reporter.Reporter
+	var reporterErrors <-chan error
+
+	if cfg.Backend.Enabled {
+		httpReporter := reporter.NewHTTPReporter(
+			cfg.Backend.BaseURL,
+			cfg.Backend.AgentToken,
+			backendRequestTimeout,
+		)
+
+		asyncReporter := reporter.NewAsyncReporter(
+			httpReporter,
+			reporter.AsyncConfig{
+				IncidentQueueSize: 64,
+
+				IncidentRetryAttempts: 8,
+
+				RetryInitialBackoff: 500 *
+					time.Millisecond,
+
+				RetryMaxBackoff: 5 *
+					time.Second,
+			},
+		)
+
+		agentReporter = asyncReporter
+		reporterErrors = asyncReporter.Errors()
+
+		go asyncReporter.Run(
+			ctx,
+		)
+
+		printLog(
+			"Reporter mode=ASYNC_HTTP backend=%s",
+			cfg.Backend.BaseURL,
+		)
+
+	} else {
+		agentReporter = reporter.NewLogReporter()
+
+		printLog(
+			"Reporter mode=LOG",
+		)
+	}
 
 	// --------------------------------------------------
 	// 13. Current Health Snapshot
@@ -360,6 +420,11 @@ func run() error {
 		event incident.Event,
 	) contracts.IncidentEvent {
 		payload := contracts.IncidentEvent{
+			EventID: buildIncidentEventID(
+				cfg.Agent.MachineID,
+				event,
+			),
+
 			MachineID: cfg.Agent.MachineID,
 
 			EventType: string(
@@ -842,6 +907,12 @@ func run() error {
 					err,
 				)
 			}
+
+		case err := <-reporterErrors:
+			printLog(
+				"REPORTER ERROR: %v",
+				err,
+			)
 		}
 	}
 }
@@ -859,5 +930,27 @@ func printLog(
 		"[%s] %s\n",
 		time.Now().Format("15:04:05"),
 		message,
+	)
+}
+
+func buildIncidentEventID(
+	machineID string,
+	event incident.Event,
+) string {
+	raw := fmt.Sprintf(
+		"%s|%s|%s|%d",
+		machineID,
+		event.EventType,
+		event.IncidentType,
+		event.OccurredAt.UnixNano(),
+	)
+
+	sum := sha256.Sum256(
+		[]byte(raw),
+	)
+
+	// 16 bytes / 128 bits เพียงพอสำหรับ ID ของเรา
+	return hex.EncodeToString(
+		sum[:16],
 	)
 }

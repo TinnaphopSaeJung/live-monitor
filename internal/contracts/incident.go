@@ -3,6 +3,7 @@ package contracts
 import "time"
 
 type IncidentEvent struct {
+	EventID   string `json:"event_id"`
 	MachineID string `json:"machine_id"`
 
 	EventType    string `json:"event_type"`
