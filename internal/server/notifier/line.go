@@ -151,6 +151,52 @@ func buildIncidentMessage(
 		In(location).
 		Format("02/01/2006 15:04:05")
 
+	// --------------------------------------------------
+	// Agent Availability
+	// --------------------------------------------------
+
+	if event.IncidentType == "AGENT_UNREACHABLE" {
+		switch event.EventType {
+
+		case "OPENED":
+			return fmt.Sprintf(
+				"🚨 Live Monitor Alert\n\n"+
+					"เครื่อง: %s\n"+
+					"ปัญหา: Monitoring Agent ติดต่อไม่ได้\n"+
+					"เริ่มตรวจไม่พบ Heartbeat: %s\n\n"+
+					"กรุณาตรวจสอบเครื่อง, Network และ Live Monitor Agent",
+				event.MachineID,
+				startedAt,
+			)
+
+		case "RESOLVED":
+			recoveredAt := event.OccurredAt.
+				In(location).
+				Format("02/01/2006 15:04:05")
+
+			duration := time.Duration(
+				valueOrZero(event.DurationMS),
+			) * time.Millisecond
+
+			return fmt.Sprintf(
+				"✅ Live Monitor Recovered\n\n"+
+					"เครื่อง: %s\n"+
+					"สถานะ: Monitoring Agent กลับมาติดต่อได้\n"+
+					"ระยะเวลาที่ติดต่อไม่ได้: %s\n"+
+					"เวลากลับมา: %s",
+				event.MachineID,
+				duration.Round(
+					time.Second,
+				),
+				recoveredAt,
+			)
+		}
+	}
+
+	// --------------------------------------------------
+	// Audio Incidents
+	// --------------------------------------------------
+
 	switch event.EventType {
 
 	case "OPENED":
@@ -192,14 +238,13 @@ func buildIncidentMessage(
 			),
 			resolvedAt,
 		)
-
-	default:
-		return fmt.Sprintf(
-			"Live Monitor\nMachine: %s\nIncident: %s",
-			event.MachineID,
-			event.IncidentType,
-		)
 	}
+
+	return fmt.Sprintf(
+		"Live Monitor\nMachine: %s\nIncident: %s",
+		event.MachineID,
+		event.IncidentType,
+	)
 }
 
 func incidentDisplayName(

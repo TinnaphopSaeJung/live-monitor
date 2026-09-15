@@ -339,7 +339,9 @@ func (r *IncidentRepository) MarkLineNotified(
 		`
 			UPDATE incident_events
 			SET line_notified_at = NOW()
-			WHERE event_id = $1
+			WHERE
+				event_id = $1
+				AND line_notified_at IS NULL
 		`,
 		eventID,
 	)
@@ -352,10 +354,88 @@ func (r *IncidentRepository) MarkLineNotified(
 
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf(
-			"incident event not found: %s",
+			"incident event not found or already notified: %s",
 			eventID,
 		)
 	}
 
 	return nil
+}
+
+func (r *IncidentRepository) FindPendingLineNotifications(
+	ctx context.Context,
+	limit int,
+) ([]contracts.IncidentEvent, error) {
+	const query = `
+		SELECT
+			event_id,
+			machine_id,
+			event_type,
+			incident_type,
+			started_at,
+			occurred_at,
+			COALESCE(resolution_reason, ''),
+			COALESCE(duration_ms, 0)
+		FROM incident_events
+		WHERE line_notified_at IS NULL
+		ORDER BY received_at ASC
+		LIMIT $1
+	`
+
+	rows, err := r.db.Query(
+		ctx,
+		query,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"find pending LINE notifications: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	var events []contracts.IncidentEvent
+
+	for rows.Next() {
+		var event contracts.IncidentEvent
+
+		var resolutionReason string
+		var durationMS int64
+
+		if err := rows.Scan(
+			&event.EventID,
+			&event.MachineID,
+			&event.EventType,
+			&event.IncidentType,
+			&event.StartedAt,
+			&event.OccurredAt,
+			&resolutionReason,
+			&durationMS,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan pending LINE notification: %w",
+				err,
+			)
+		}
+
+		if event.EventType == "RESOLVED" {
+			event.ResolutionReason = &resolutionReason
+			event.DurationMS = &durationMS
+		}
+
+		events = append(
+			events,
+			event,
+		)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate pending LINE notifications: %w",
+			err,
+		)
+	}
+
+	return events, nil
 }

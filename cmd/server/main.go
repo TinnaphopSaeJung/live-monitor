@@ -10,15 +10,18 @@ import (
 	"os"
 	"time"
 
-	"live-monitor/cmd/server/database"
-	"live-monitor/cmd/server/notifier"
-	"live-monitor/cmd/server/repository"
 	"live-monitor/internal/contracts"
+	"live-monitor/internal/server/database"
+	servermonitor "live-monitor/internal/server/monitor"
+	"live-monitor/internal/server/notifier"
+	"live-monitor/internal/server/repository"
+	"live-monitor/internal/server/service"
+	serverworker "live-monitor/internal/server/worker"
 )
 
 func main() {
 	// --------------------------------------------------
-	// 1. Environment variables
+	// 1. Environment Variables
 	// --------------------------------------------------
 
 	agentToken := os.Getenv(
@@ -58,10 +61,14 @@ func main() {
 	}
 
 	// --------------------------------------------------
-	// 2. Database
+	// 2. Application Context
 	// --------------------------------------------------
 
 	ctx := context.Background()
+
+	// --------------------------------------------------
+	// 3. PostgreSQL
+	// --------------------------------------------------
 
 	db, err := database.NewPostgres(
 		ctx,
@@ -80,19 +87,26 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// 3. Repositories
+	// 4. Repositories
 	// --------------------------------------------------
 
-	machineRepository := repository.NewMachineRepository(
-		db,
-	)
+	machineRepository :=
+		repository.NewMachineRepository(
+			db,
+		)
 
-	incidentRepository := repository.NewIncidentRepository(
-		db,
-	)
+	incidentRepository :=
+		repository.NewIncidentRepository(
+			db,
+		)
+
+	availabilityRepository :=
+		repository.NewAvailabilityRepository(
+			db,
+		)
 
 	// --------------------------------------------------
-	// 4. LINE Notifier
+	// 5. LINE Client
 	// --------------------------------------------------
 
 	lineNotifier := notifier.NewLINEClient(
@@ -106,12 +120,107 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// 5. Router
+	// 6. Services
+	//
+	// IMPORTANT:
+	//
+	// IncidentService ตอนนี้รับผิดชอบแค่:
+	//
+	// Incident Event
+	//      ↓
+	// PostgreSQL
+	//
+	// ไม่ส่ง LINE แล้ว
+	// --------------------------------------------------
+
+	incidentService :=
+		service.NewIncidentService(
+			incidentRepository,
+		)
+
+		// --------------------------------------------------
+		// 7. Availability Monitor
+		//
+		// Heartbeat หายเกิน 15s
+		//      ↓
+		// AGENT_UNREACHABLE
+		//
+		// Heartbeat กลับมา
+		//      ↓
+		// HEARTBEAT_RESUMED
+		//
+		// NOTE:
+		// ตอนนี้ AvailabilityMonitor
+		// ยังใช้ IncidentRepository โดยตรง
+		//
+		// Step ถัดไปเราจะ refactor
+		// ให้ใช้ IncidentService
+		// --------------------------------------------------
+
+	availabilityMonitor := servermonitor.NewAvailabilityMonitor(
+		availabilityRepository,
+		incidentService,
+
+		15*time.Second,
+		5*time.Second,
+		15*time.Second,
+	)
+
+	// --------------------------------------------------
+	// 8. LINE Notification Worker
+	//
+	// หา:
+	//
+	// incident_events
+	// WHERE line_notified_at IS NULL
+	//
+	// แล้ว:
+	//
+	// LINE Push
+	//      ↓
+	// MarkLineNotified()
+	// --------------------------------------------------
+
+	notificationWorker :=
+		serverworker.NewNotificationWorker(
+			incidentRepository,
+			lineNotifier,
+
+			2*time.Second, // check interval
+
+			20, // batch size
+		)
+
+	// --------------------------------------------------
+	// 9. Start Background Workers
+	// --------------------------------------------------
+
+	go availabilityMonitor.Run(
+		ctx,
+	)
+
+	go notificationWorker.Run(
+		ctx,
+	)
+
+	// --------------------------------------------------
+	// 10. HTTP Router
 	// --------------------------------------------------
 
 	mux := http.NewServeMux()
 
+	// --------------------------------------------------
 	// Heartbeat
+	//
+	// Agent
+	//   ↓
+	// POST /api/v1/agents/heartbeat
+	//   ↓
+	// MachineRepository
+	//   ↓
+	// machines
+	// --------------------------------------------------
+
 	mux.Handle(
 		"POST /api/v1/agents/heartbeat",
 		authenticate(
@@ -122,20 +231,33 @@ func main() {
 		),
 	)
 
-	// Incident
+	// --------------------------------------------------
+	// Incident Event
+	//
+	// Agent
+	//   ↓
+	// POST /api/v1/incidents/events
+	//   ↓
+	// IncidentService
+	//   ↓
+	// PostgreSQL
+	//
+	// LINE ไม่ได้อยู่ใน HTTP request path แล้ว
+	// NotificationWorker จะส่งภายหลัง
+	// --------------------------------------------------
+
 	mux.Handle(
 		"POST /api/v1/incidents/events",
 		authenticate(
 			agentToken,
 			handleIncident(
-				incidentRepository,
-				lineNotifier,
+				incidentService,
 			),
 		),
 	)
 
 	// --------------------------------------------------
-	// 6. HTTP Server
+	// 11. HTTP Server
 	// --------------------------------------------------
 
 	server := &http.Server{
@@ -153,7 +275,7 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// 7. Start Server
+	// 12. Start HTTP Server
 	// --------------------------------------------------
 
 	if err := server.ListenAndServe(); err != nil &&
@@ -166,17 +288,18 @@ func main() {
 	}
 }
 
-// --------------------------------------------------
+// ==================================================
 // Heartbeat Handler
 //
-// Agent
-//   ↓
 // POST /api/v1/agents/heartbeat
-//   ↓
-// MachineRepository
-//   ↓
-// machines
-// --------------------------------------------------
+//
+// หน้าที่:
+// - Decode
+// - Validate
+// - UPSERT current machine state
+//
+// Heartbeat ไม่เกี่ยวกับ LINE โดยตรง
+// ==================================================
 
 func handleHeartbeat(
 	machineRepository *repository.MachineRepository,
@@ -239,7 +362,7 @@ func handleHeartbeat(
 		}
 
 		// ------------------------------------------
-		// Persist current machine state
+		// PostgreSQL
 		// ------------------------------------------
 
 		if err := machineRepository.UpsertHeartbeat(
@@ -277,29 +400,38 @@ func handleHeartbeat(
 			),
 		)
 
+		// ------------------------------------------
+		// Success
+		// ------------------------------------------
+
 		w.WriteHeader(
 			http.StatusNoContent,
 		)
 	}
 }
 
-// --------------------------------------------------
+// ==================================================
 // Incident Handler
 //
-// Agent
-//   ↓
-// Incident Event
-//   ↓
+// POST /api/v1/incidents/events
+//
+// หน้าที่:
+//
+// HTTP Layer
+//    ↓
+// Validate
+//    ↓
+// IncidentService
+//    ↓
 // PostgreSQL
-//   ↓
-// Duplicate check
-//   ↓
-// LINE
-// --------------------------------------------------
+//    ↓
+// 204
+//
+// LINE ถูกแยกออกไปทำใน NotificationWorker
+// ==================================================
 
 func handleIncident(
-	incidentRepository *repository.IncidentRepository,
-	lineNotifier *notifier.LINEClient,
+	incidentService *service.IncidentService,
 ) http.HandlerFunc {
 	return func(
 		w http.ResponseWriter,
@@ -325,7 +457,7 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// Basic validation
+		// Basic Validation
 		// ------------------------------------------
 
 		if event.EventID == "" {
@@ -389,7 +521,7 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// Event type validation
+		// Event Type Validation
 		// ------------------------------------------
 
 		if event.EventType != "OPENED" &&
@@ -405,7 +537,7 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// RESOLVED validation
+		// RESOLVED Validation
 		// ------------------------------------------
 
 		if event.EventType == "RESOLVED" {
@@ -432,28 +564,21 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// PostgreSQL
+		// Incident Service
 		//
-		// Repository จะ:
+		// Service จะ persist DB เท่านั้น
 		//
-		// BEGIN
-		//
-		// ensure machine
-		// insert incident_events
-		// update incidents
-		//
-		// COMMIT
-		//
-		// และใช้ event_id deduplication
+		// ไม่มี LINE call ตรงนี้แล้ว
 		// ------------------------------------------
 
-		result, err := incidentRepository.ProcessEvent(
+		result, err := incidentService.ProcessEvent(
 			r.Context(),
 			event,
 		)
 		if err != nil {
+
 			log.Printf(
-				"INCIDENT DB ERROR event_id=%s machine=%s error=%v",
+				"INCIDENT PROCESS ERROR event_id=%s machine=%s error=%v",
 				event.EventID,
 				event.MachineID,
 				err,
@@ -469,19 +594,20 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// Duplicate + LINE เคยส่งแล้ว
+		// Duplicate
+		//
+		// event_id เคยมีใน PostgreSQL แล้ว
 		//
 		// ไม่ต้องทำอะไรอีก
 		//
-		// สำคัญ:
-		// ตรงนี้ป้องกัน LINE Alert ซ้ำจาก Agent Retry
+		// NotificationWorker จะเป็นคนดู
+		// line_notified_at เอง
 		// ------------------------------------------
 
-		if result.Duplicate &&
-			result.LineNotified {
+		if result.Duplicate {
 
 			log.Printf(
-				"INCIDENT DUPLICATE event_id=%s already_notified=true ignored",
+				"INCIDENT DUPLICATE event_id=%s ignored",
 				event.EventID,
 			)
 
@@ -493,143 +619,46 @@ func handleIncident(
 		}
 
 		// ------------------------------------------
-		// Event ใหม่
+		// New Incident Event
 		// ------------------------------------------
-
-		if !result.Duplicate {
-			log.Printf(
-				"INCIDENT event_id=%s machine=%s event=%s type=%s started_at=%s occurred_at=%s",
-				event.EventID,
-				event.MachineID,
-				event.EventType,
-				event.IncidentType,
-				event.StartedAt.Format(
-					time.RFC3339,
-				),
-				event.OccurredAt.Format(
-					time.RFC3339,
-				),
-			)
-
-			if event.ResolutionReason != nil {
-				log.Printf(
-					"INCIDENT RESOLUTION machine=%s type=%s reason=%s duration_ms=%d",
-					event.MachineID,
-					event.IncidentType,
-					*event.ResolutionReason,
-					valueOrZero(
-						event.DurationMS,
-					),
-				)
-			}
-		}
-
-		// ------------------------------------------
-		// Duplicate แต่ LINE ยังไม่เคยสำเร็จ
-		//
-		// หมายถึง Agent กำลัง Retry
-		//
-		// เราต้องลอง LINE ต่อ
-		// ------------------------------------------
-
-		if result.Duplicate &&
-			!result.LineNotified {
-
-			log.Printf(
-				"INCIDENT DUPLICATE event_id=%s line_notified=false retrying LINE",
-				event.EventID,
-			)
-		}
-
-		// ------------------------------------------
-		// Send LINE
-		//
-		// LINEClient ใช้ X-Line-Retry-Key
-		// จาก event_id แบบ deterministic
-		//
-		// event_id เดิม
-		// → retry key เดิม
-		//
-		// LINE ป้องกันข้อความซ้ำอีกชั้น
-		// ------------------------------------------
-
-		if err := lineNotifier.SendIncident(
-			r.Context(),
-			event,
-		); err != nil {
-
-			log.Printf(
-				"LINE NOTIFICATION ERROR event_id=%s machine=%s type=%s error=%v",
-				event.EventID,
-				event.MachineID,
-				event.IncidentType,
-				err,
-			)
-
-			// --------------------------------------
-			// ตอบ error กลับ Agent
-			//
-			// AsyncReporter ของ Agent จะ Retry
-			// event_id เดิม
-			// --------------------------------------
-
-			http.Error(
-				w,
-				"LINE notification failed",
-				http.StatusBadGateway,
-			)
-
-			return
-		}
-
-		// ------------------------------------------
-		// LINE สำเร็จ
-		//
-		// Mark ใน PostgreSQL ว่า Event นี้
-		// แจ้ง LINE แล้ว
-		// ------------------------------------------
-
-		if err := incidentRepository.MarkLineNotified(
-			r.Context(),
-			event.EventID,
-		); err != nil {
-
-			log.Printf(
-				"LINE NOTIFICATION DB ERROR event_id=%s machine=%s error=%v",
-				event.EventID,
-				event.MachineID,
-				err,
-			)
-
-			// --------------------------------------
-			// LINE อาจถูกส่งไปแล้ว
-			//
-			// แต่ mark DB ไม่สำเร็จ
-			//
-			// เราตอบ 500 ให้ Agent Retry
-			//
-			// LINE Retry Key จะช่วยไม่ให้ Push ซ้ำ
-			// --------------------------------------
-
-			http.Error(
-				w,
-				"internal server error",
-				http.StatusInternalServerError,
-			)
-
-			return
-		}
 
 		log.Printf(
-			"LINE NOTIFICATION SENT event_id=%s machine=%s type=%s event=%s",
+			"INCIDENT event_id=%s machine=%s event=%s type=%s started_at=%s occurred_at=%s",
 			event.EventID,
 			event.MachineID,
-			event.IncidentType,
 			event.EventType,
+			event.IncidentType,
+			event.StartedAt.Format(
+				time.RFC3339,
+			),
+			event.OccurredAt.Format(
+				time.RFC3339,
+			),
 		)
 
 		// ------------------------------------------
-		// Success
+		// Resolution Log
+		// ------------------------------------------
+
+		if event.ResolutionReason != nil {
+
+			log.Printf(
+				"INCIDENT RESOLUTION machine=%s type=%s reason=%s duration_ms=%d",
+				event.MachineID,
+				event.IncidentType,
+				*event.ResolutionReason,
+				valueOrZero(
+					event.DurationMS,
+				),
+			)
+		}
+
+		// ------------------------------------------
+		// สำคัญ:
+		//
+		// เราตอบ Agent ตรงนี้เลย
+		//
+		// ไม่ต้องรอ LINE
 		// ------------------------------------------
 
 		w.WriteHeader(
@@ -638,13 +667,12 @@ func handleIncident(
 	}
 }
 
-// --------------------------------------------------
-// Bearer Token Authentication
+// ==================================================
+// Authentication Middleware
 //
-// Agent:
-//
-// Authorization: Bearer <AGENT_TOKEN>
-// --------------------------------------------------
+// Authorization:
+// Bearer <AGENT_TOKEN>
+// ==================================================
 
 func authenticate(
 	expectedToken string,
@@ -681,9 +709,9 @@ func authenticate(
 	)
 }
 
-// --------------------------------------------------
+// ==================================================
 // Helper
-// --------------------------------------------------
+// ==================================================
 
 func valueOrZero(
 	value *int64,
