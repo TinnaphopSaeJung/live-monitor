@@ -1,76 +1,141 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
+	"live-monitor/cmd/server/database"
+	"live-monitor/cmd/server/notifier"
+	"live-monitor/cmd/server/repository"
 	"live-monitor/internal/contracts"
 )
 
-// --------------------------------------------------
-// In-memory incident event deduplication
-//
-// ใช้สำหรับ prototype ก่อน
-//
-// event_id เดิมที่ Retry เข้ามาซ้ำ
-// จะไม่ถูก process ซ้ำ
-//
-// หมายเหตุ:
-// ข้อมูลนี้หายเมื่อ Server restart
-// ภายหลัง PostgreSQL จะใช้ UNIQUE(event_id)
-// --------------------------------------------------
-
-var seenIncidentEvents sync.Map
-
 func main() {
 	// --------------------------------------------------
-	// 1. Load Agent Token
+	// 1. Environment variables
 	// --------------------------------------------------
 
-	token := os.Getenv(
+	agentToken := os.Getenv(
 		"AGENT_TOKEN",
 	)
-
-	if token == "" {
+	if agentToken == "" {
 		log.Fatal(
 			"AGENT_TOKEN environment variable is required",
 		)
 	}
 
+	databaseURL := os.Getenv(
+		"DATABASE_URL",
+	)
+	if databaseURL == "" {
+		log.Fatal(
+			"DATABASE_URL environment variable is required",
+		)
+	}
+
+	lineChannelAccessToken := os.Getenv(
+		"LINE_CHANNEL_ACCESS_TOKEN",
+	)
+	if lineChannelAccessToken == "" {
+		log.Fatal(
+			"LINE_CHANNEL_ACCESS_TOKEN environment variable is required",
+		)
+	}
+
+	lineTargetID := os.Getenv(
+		"LINE_TARGET_ID",
+	)
+	if lineTargetID == "" {
+		log.Fatal(
+			"LINE_TARGET_ID environment variable is required",
+		)
+	}
+
 	// --------------------------------------------------
-	// 2. HTTP Router
+	// 2. Database
+	// --------------------------------------------------
+
+	ctx := context.Background()
+
+	db, err := database.NewPostgres(
+		ctx,
+		databaseURL,
+	)
+	if err != nil {
+		log.Fatalf(
+			"connect database: %v",
+			err,
+		)
+	}
+	defer db.Close()
+
+	log.Println(
+		"Connected to PostgreSQL",
+	)
+
+	// --------------------------------------------------
+	// 3. Repositories
+	// --------------------------------------------------
+
+	machineRepository := repository.NewMachineRepository(
+		db,
+	)
+
+	incidentRepository := repository.NewIncidentRepository(
+		db,
+	)
+
+	// --------------------------------------------------
+	// 4. LINE Notifier
+	// --------------------------------------------------
+
+	lineNotifier := notifier.NewLINEClient(
+		lineChannelAccessToken,
+		lineTargetID,
+		3*time.Second,
+	)
+
+	log.Println(
+		"LINE notifier configured",
+	)
+
+	// --------------------------------------------------
+	// 5. Router
 	// --------------------------------------------------
 
 	mux := http.NewServeMux()
 
+	// Heartbeat
 	mux.Handle(
 		"POST /api/v1/agents/heartbeat",
 		authenticate(
-			token,
-			http.HandlerFunc(
-				handleHeartbeat,
+			agentToken,
+			handleHeartbeat(
+				machineRepository,
 			),
 		),
 	)
 
+	// Incident
 	mux.Handle(
 		"POST /api/v1/incidents/events",
 		authenticate(
-			token,
-			http.HandlerFunc(
-				handleIncident,
+			agentToken,
+			handleIncident(
+				incidentRepository,
+				lineNotifier,
 			),
 		),
 	)
 
 	// --------------------------------------------------
-	// 3. HTTP Server
+	// 6. HTTP Server
 	// --------------------------------------------------
 
 	server := &http.Server{
@@ -88,7 +153,7 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// 4. Start Server
+	// 7. Start Server
 	// --------------------------------------------------
 
 	if err := server.ListenAndServe(); err != nil &&
@@ -104,277 +169,481 @@ func main() {
 // --------------------------------------------------
 // Heartbeat Handler
 //
-// Endpoint:
+// Agent
+//   ↓
 // POST /api/v1/agents/heartbeat
-//
-// หน้าที่:
-// รับ current snapshot จาก Agent
-//
-// ตอนนี้:
-// log ออก terminal
-//
-// ต่อไป:
-// update machine status / last_seen ใน DB
+//   ↓
+// MachineRepository
+//   ↓
+// machines
 // --------------------------------------------------
 
 func handleHeartbeat(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	var heartbeat contracts.Heartbeat
+	machineRepository *repository.MachineRepository,
+) http.HandlerFunc {
+	return func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		var heartbeat contracts.Heartbeat
 
-	if err := json.NewDecoder(
-		r.Body,
-	).Decode(&heartbeat); err != nil {
+		// ------------------------------------------
+		// Decode
+		// ------------------------------------------
 
-		http.Error(
-			w,
-			"invalid request body",
-			http.StatusBadRequest,
-		)
+		if err := json.NewDecoder(
+			r.Body,
+		).Decode(&heartbeat); err != nil {
 
-		return
-	}
+			http.Error(
+				w,
+				"invalid request body",
+				http.StatusBadRequest,
+			)
 
-	// --------------------------------------------------
-	// Basic validation
-	// --------------------------------------------------
+			return
+		}
 
-	if heartbeat.MachineID == "" {
-		http.Error(
-			w,
-			"machine_id is required",
-			http.StatusBadRequest,
-		)
+		// ------------------------------------------
+		// Validation
+		// ------------------------------------------
 
-		return
-	}
+		if heartbeat.MachineID == "" {
+			http.Error(
+				w,
+				"machine_id is required",
+				http.StatusBadRequest,
+			)
 
-	if heartbeat.SentAt.IsZero() {
-		http.Error(
-			w,
-			"sent_at is required",
-			http.StatusBadRequest,
-		)
+			return
+		}
 
-		return
-	}
+		if heartbeat.SentAt.IsZero() {
+			http.Error(
+				w,
+				"sent_at is required",
+				http.StatusBadRequest,
+			)
 
-	if heartbeat.StreamState == "" {
-		http.Error(
-			w,
-			"stream_state is required",
-			http.StatusBadRequest,
-		)
+			return
+		}
 
-		return
-	}
+		if heartbeat.StreamState == "" {
+			http.Error(
+				w,
+				"stream_state is required",
+				http.StatusBadRequest,
+			)
 
-	// --------------------------------------------------
-	// Prototype processing
-	// --------------------------------------------------
+			return
+		}
 
-	log.Printf(
-		"HEARTBEAT machine=%s stream=%s monitoring=%t incidents=%v sent_at=%s",
-		heartbeat.MachineID,
-		heartbeat.StreamState,
-		heartbeat.MonitoringActive,
-		heartbeat.ActiveIncidents,
-		heartbeat.SentAt.Format(
-			time.RFC3339,
-		),
-	)
+		// ------------------------------------------
+		// Persist current machine state
+		// ------------------------------------------
 
-	// --------------------------------------------------
-	// 204 No Content
-	//
-	// Agent ไม่ต้องการ response body
-	// แค่รู้ว่า Backend รับสำเร็จ
-	// --------------------------------------------------
+		if err := machineRepository.UpsertHeartbeat(
+			r.Context(),
+			heartbeat,
+		); err != nil {
 
-	w.WriteHeader(
-		http.StatusNoContent,
-	)
-}
+			log.Printf(
+				"HEARTBEAT DB ERROR machine=%s error=%v",
+				heartbeat.MachineID,
+				err,
+			)
 
-// --------------------------------------------------
-// Incident Handler
-//
-// Endpoint:
-// POST /api/v1/incidents/events
-//
-// รับทั้ง:
-// OPENED
-// RESOLVED
-//
-// ตอนนี้:
-// - validate
-// - deduplicate ด้วย event_id
-// - log
-//
-// ต่อไป:
-// - persist DB
-// - trigger LINE
-// --------------------------------------------------
+			http.Error(
+				w,
+				"internal server error",
+				http.StatusInternalServerError,
+			)
 
-func handleIncident(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	var event contracts.IncidentEvent
+			return
+		}
 
-	if err := json.NewDecoder(
-		r.Body,
-	).Decode(&event); err != nil {
-
-		http.Error(
-			w,
-			"invalid request body",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------
-	// Validation
-	// --------------------------------------------------
-
-	if event.EventID == "" {
-		http.Error(
-			w,
-			"event_id is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	if event.MachineID == "" {
-		http.Error(
-			w,
-			"machine_id is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	if event.EventType == "" {
-		http.Error(
-			w,
-			"event_type is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	if event.IncidentType == "" {
-		http.Error(
-			w,
-			"incident_type is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	if event.StartedAt.IsZero() {
-		http.Error(
-			w,
-			"started_at is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	if event.OccurredAt.IsZero() {
-		http.Error(
-			w,
-			"occurred_at is required",
-			http.StatusBadRequest,
-		)
-
-		return
-	}
-
-	// --------------------------------------------------
-	// Deduplication
-	//
-	// Retry จาก Agent จะใช้ event_id เดิม
-	//
-	// ถ้าเคยรับ event_id นี้แล้ว:
-	// - ไม่ process ซ้ำ
-	// - ตอบ 204
-	//
-	// สำคัญ:
-	// เราตอบ success เพื่อให้ Agent หยุด Retry
-	// --------------------------------------------------
-
-	if _, loaded := seenIncidentEvents.LoadOrStore(
-		event.EventID,
-		struct{}{},
-	); loaded {
+		// ------------------------------------------
+		// Log
+		// ------------------------------------------
 
 		log.Printf(
-			"INCIDENT DUPLICATE event_id=%s ignored",
-			event.EventID,
+			"HEARTBEAT machine=%s stream=%s monitoring=%t incidents=%v sent_at=%s",
+			heartbeat.MachineID,
+			heartbeat.StreamState,
+			heartbeat.MonitoringActive,
+			heartbeat.ActiveIncidents,
+			heartbeat.SentAt.Format(
+				time.RFC3339,
+			),
 		)
 
 		w.WriteHeader(
 			http.StatusNoContent,
 		)
-
-		return
 	}
+}
 
-	// --------------------------------------------------
-	// Prototype Incident Processing
-	// --------------------------------------------------
+// --------------------------------------------------
+// Incident Handler
+//
+// Agent
+//   ↓
+// Incident Event
+//   ↓
+// PostgreSQL
+//   ↓
+// Duplicate check
+//   ↓
+// LINE
+// --------------------------------------------------
 
-	log.Printf(
-		"INCIDENT event_id=%s machine=%s event=%s type=%s started_at=%s occurred_at=%s",
-		event.EventID,
-		event.MachineID,
-		event.EventType,
-		event.IncidentType,
-		event.StartedAt.Format(
-			time.RFC3339,
-		),
-		event.OccurredAt.Format(
-			time.RFC3339,
-		),
-	)
+func handleIncident(
+	incidentRepository *repository.IncidentRepository,
+	lineNotifier *notifier.LINEClient,
+) http.HandlerFunc {
+	return func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		var event contracts.IncidentEvent
 
-	// --------------------------------------------------
-	// Resolution information
-	// --------------------------------------------------
+		// ------------------------------------------
+		// Decode
+		// ------------------------------------------
 
-	if event.ResolutionReason != nil {
+		if err := json.NewDecoder(
+			r.Body,
+		).Decode(&event); err != nil {
+
+			http.Error(
+				w,
+				"invalid request body",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// Basic validation
+		// ------------------------------------------
+
+		if event.EventID == "" {
+			http.Error(
+				w,
+				"event_id is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		if event.MachineID == "" {
+			http.Error(
+				w,
+				"machine_id is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		if event.EventType == "" {
+			http.Error(
+				w,
+				"event_type is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		if event.IncidentType == "" {
+			http.Error(
+				w,
+				"incident_type is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		if event.StartedAt.IsZero() {
+			http.Error(
+				w,
+				"started_at is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		if event.OccurredAt.IsZero() {
+			http.Error(
+				w,
+				"occurred_at is required",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// Event type validation
+		// ------------------------------------------
+
+		if event.EventType != "OPENED" &&
+			event.EventType != "RESOLVED" {
+
+			http.Error(
+				w,
+				"invalid event_type",
+				http.StatusBadRequest,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// RESOLVED validation
+		// ------------------------------------------
+
+		if event.EventType == "RESOLVED" {
+
+			if event.ResolutionReason == nil {
+				http.Error(
+					w,
+					"resolution_reason is required for RESOLVED event",
+					http.StatusBadRequest,
+				)
+
+				return
+			}
+
+			if event.DurationMS == nil {
+				http.Error(
+					w,
+					"duration_ms is required for RESOLVED event",
+					http.StatusBadRequest,
+				)
+
+				return
+			}
+		}
+
+		// ------------------------------------------
+		// PostgreSQL
+		//
+		// Repository จะ:
+		//
+		// BEGIN
+		//
+		// ensure machine
+		// insert incident_events
+		// update incidents
+		//
+		// COMMIT
+		//
+		// และใช้ event_id deduplication
+		// ------------------------------------------
+
+		result, err := incidentRepository.ProcessEvent(
+			r.Context(),
+			event,
+		)
+		if err != nil {
+			log.Printf(
+				"INCIDENT DB ERROR event_id=%s machine=%s error=%v",
+				event.EventID,
+				event.MachineID,
+				err,
+			)
+
+			http.Error(
+				w,
+				"internal server error",
+				http.StatusInternalServerError,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// Duplicate + LINE เคยส่งแล้ว
+		//
+		// ไม่ต้องทำอะไรอีก
+		//
+		// สำคัญ:
+		// ตรงนี้ป้องกัน LINE Alert ซ้ำจาก Agent Retry
+		// ------------------------------------------
+
+		if result.Duplicate &&
+			result.LineNotified {
+
+			log.Printf(
+				"INCIDENT DUPLICATE event_id=%s already_notified=true ignored",
+				event.EventID,
+			)
+
+			w.WriteHeader(
+				http.StatusNoContent,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// Event ใหม่
+		// ------------------------------------------
+
+		if !result.Duplicate {
+			log.Printf(
+				"INCIDENT event_id=%s machine=%s event=%s type=%s started_at=%s occurred_at=%s",
+				event.EventID,
+				event.MachineID,
+				event.EventType,
+				event.IncidentType,
+				event.StartedAt.Format(
+					time.RFC3339,
+				),
+				event.OccurredAt.Format(
+					time.RFC3339,
+				),
+			)
+
+			if event.ResolutionReason != nil {
+				log.Printf(
+					"INCIDENT RESOLUTION machine=%s type=%s reason=%s duration_ms=%d",
+					event.MachineID,
+					event.IncidentType,
+					*event.ResolutionReason,
+					valueOrZero(
+						event.DurationMS,
+					),
+				)
+			}
+		}
+
+		// ------------------------------------------
+		// Duplicate แต่ LINE ยังไม่เคยสำเร็จ
+		//
+		// หมายถึง Agent กำลัง Retry
+		//
+		// เราต้องลอง LINE ต่อ
+		// ------------------------------------------
+
+		if result.Duplicate &&
+			!result.LineNotified {
+
+			log.Printf(
+				"INCIDENT DUPLICATE event_id=%s line_notified=false retrying LINE",
+				event.EventID,
+			)
+		}
+
+		// ------------------------------------------
+		// Send LINE
+		//
+		// LINEClient ใช้ X-Line-Retry-Key
+		// จาก event_id แบบ deterministic
+		//
+		// event_id เดิม
+		// → retry key เดิม
+		//
+		// LINE ป้องกันข้อความซ้ำอีกชั้น
+		// ------------------------------------------
+
+		if err := lineNotifier.SendIncident(
+			r.Context(),
+			event,
+		); err != nil {
+
+			log.Printf(
+				"LINE NOTIFICATION ERROR event_id=%s machine=%s type=%s error=%v",
+				event.EventID,
+				event.MachineID,
+				event.IncidentType,
+				err,
+			)
+
+			// --------------------------------------
+			// ตอบ error กลับ Agent
+			//
+			// AsyncReporter ของ Agent จะ Retry
+			// event_id เดิม
+			// --------------------------------------
+
+			http.Error(
+				w,
+				"LINE notification failed",
+				http.StatusBadGateway,
+			)
+
+			return
+		}
+
+		// ------------------------------------------
+		// LINE สำเร็จ
+		//
+		// Mark ใน PostgreSQL ว่า Event นี้
+		// แจ้ง LINE แล้ว
+		// ------------------------------------------
+
+		if err := incidentRepository.MarkLineNotified(
+			r.Context(),
+			event.EventID,
+		); err != nil {
+
+			log.Printf(
+				"LINE NOTIFICATION DB ERROR event_id=%s machine=%s error=%v",
+				event.EventID,
+				event.MachineID,
+				err,
+			)
+
+			// --------------------------------------
+			// LINE อาจถูกส่งไปแล้ว
+			//
+			// แต่ mark DB ไม่สำเร็จ
+			//
+			// เราตอบ 500 ให้ Agent Retry
+			//
+			// LINE Retry Key จะช่วยไม่ให้ Push ซ้ำ
+			// --------------------------------------
+
+			http.Error(
+				w,
+				"internal server error",
+				http.StatusInternalServerError,
+			)
+
+			return
+		}
+
 		log.Printf(
-			"INCIDENT RESOLUTION machine=%s type=%s reason=%s duration_ms=%d",
+			"LINE NOTIFICATION SENT event_id=%s machine=%s type=%s event=%s",
+			event.EventID,
 			event.MachineID,
 			event.IncidentType,
-			*event.ResolutionReason,
-			valueOrZero(
-				event.DurationMS,
-			),
+			event.EventType,
+		)
+
+		// ------------------------------------------
+		// Success
+		// ------------------------------------------
+
+		w.WriteHeader(
+			http.StatusNoContent,
 		)
 	}
-
-	w.WriteHeader(
-		http.StatusNoContent,
-	)
 }
 
 // --------------------------------------------------
 // Bearer Token Authentication
 //
-// Request:
+// Agent:
 //
-// Authorization: Bearer <token>
+// Authorization: Bearer <AGENT_TOKEN>
 // --------------------------------------------------
 
 func authenticate(
