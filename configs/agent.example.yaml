@@ -22,3 +22,6 @@ audio:
   low_level_window_duration: "1s"
 
   recovery_duration: "5s"
+
+  sample_stall_duration: "5s"
+  sample_recovery_duration: "5s"

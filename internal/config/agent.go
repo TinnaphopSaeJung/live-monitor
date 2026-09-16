@@ -24,13 +24,14 @@ type OBSConfig struct {
 }
 
 type AudioConfig struct {
-	SignalLossDuration string `yaml:"signal_loss_duration"`
-
+	SignalLossDuration     string  `yaml:"signal_loss_duration"`
 	LowLevelThresholdDB    float64 `yaml:"low_level_threshold_db"`
 	LowLevelDuration       string  `yaml:"low_level_duration"`
 	LowLevelWindowDuration string  `yaml:"low_level_window_duration"`
+	RecoveryDuration       string  `yaml:"recovery_duration"`
 
-	RecoveryDuration string `yaml:"recovery_duration"`
+	SampleStallDuration    string `yaml:"sample_stall_duration"`
+	SampleRecoveryDuration string `yaml:"sample_recovery_duration"`
 }
 
 type AgentInfoConfig struct {

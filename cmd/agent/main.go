@@ -2,15 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"time"
-
-	"crypto/sha256"
-	"encoding/hex"
 
 	"live-monitor/internal/agent/audio"
 	"live-monitor/internal/agent/detector"
@@ -107,6 +106,30 @@ func run() error {
 		)
 	}
 
+	// --------------------------------------------------
+	// Audio Sample Watchdog durations
+	// --------------------------------------------------
+
+	sampleStallDuration, err := time.ParseDuration(
+		cfg.Audio.SampleStallDuration,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"parse sample stall duration: %w",
+			err,
+		)
+	}
+
+	sampleRecoveryDuration, err := time.ParseDuration(
+		cfg.Audio.SampleRecoveryDuration,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"parse sample recovery duration: %w",
+			err,
+		)
+	}
+
 	var backendRequestTimeout time.Duration
 
 	if cfg.Backend.Enabled {
@@ -153,6 +176,20 @@ func run() error {
 	}
 
 	muteDetector := detector.NewMuteDetector()
+
+	// --------------------------------------------------
+	// Audio Sample Watchdog
+	//
+	// หน้าที่:
+	// ตรวจว่า target audio.Sample
+	// ยังไหลเข้ามาตามปกติหรือไม่
+	// --------------------------------------------------
+
+	sampleWatchdog :=
+		detector.NewAudioSampleWatchdog(
+			sampleStallDuration,
+			sampleRecoveryDuration,
+		)
 
 	// --------------------------------------------------
 	// 5. Connect OBS
@@ -214,6 +251,21 @@ func run() error {
 	)
 
 	// --------------------------------------------------
+	// Sync initial monitoring state เข้า Watchdog
+	//
+	// สำคัญสำหรับ case:
+	//
+	// Agent start
+	// Streaming=true
+	// แต่ไม่เคยได้ audio sample เลย
+	// --------------------------------------------------
+
+	sampleWatchdog.SetMonitoring(
+		monitoringContext.MonitoringEnabled(),
+		time.Now(),
+	)
+
+	// --------------------------------------------------
 	// 8. Initial Track Routing
 	// --------------------------------------------------
 
@@ -268,9 +320,6 @@ func run() error {
 
 	// --------------------------------------------------
 	// 10. Graceful shutdown context
-	//
-	// ต้องสร้างก่อน reconcileIncidents
-	// เพราะ Reporter จะใช้ ctx
 	// --------------------------------------------------
 
 	ctx, stop := signal.NotifyContext(
@@ -287,9 +336,6 @@ func run() error {
 
 	// --------------------------------------------------
 	// 12. Reporter
-	//
-	// ตอนนี้ใช้ LogReporter
-	// ต่อไปเปลี่ยนเป็น HTTPReporter ได้
 	// --------------------------------------------------
 
 	var agentReporter reporter.Reporter
@@ -340,8 +386,9 @@ func run() error {
 	// --------------------------------------------------
 	// 13. Current Health Snapshot
 	//
-	// อ่าน Current State ของ Detector
-	// ไม่ได้อาศัยเฉพาะ transition
+	// NOTE:
+	// SampleWatchdog ยังไม่ถูกใส่เข้า IncidentManager
+	// ใน Step นี้
 	// --------------------------------------------------
 
 	currentHealth := func() incident.HealthSnapshot {
@@ -362,6 +409,9 @@ func run() error {
 
 	// --------------------------------------------------
 	// 14. Build Heartbeat
+	//
+	// NOTE:
+	// SampleState ยังไม่ถูกส่ง Backend ใน Step นี้
 	// --------------------------------------------------
 
 	buildHeartbeat := func(
@@ -455,14 +505,6 @@ func run() error {
 
 	// --------------------------------------------------
 	// 15. Incident Reconciliation
-	//
-	// Detector States
-	//       +
-	// Monitoring Context
-	//       ↓
-	// IncidentManager
-	//       ↓
-	// Reporter
 	// --------------------------------------------------
 
 	reconcileIncidents := func(
@@ -494,10 +536,6 @@ func run() error {
 				)
 			}
 
-			// ------------------------------------------
-			// Report Incident Event
-			// ------------------------------------------
-
 			payload := buildIncidentEvent(
 				event,
 			)
@@ -516,9 +554,6 @@ func run() error {
 
 	// --------------------------------------------------
 	// 16. Reconcile initial state
-	//
-	// เช่น Agent start ตอนที่ OBS Streaming
-	// และ Routing ผิดอยู่ก่อนแล้ว
 	// --------------------------------------------------
 
 	reconcileIncidents(
@@ -551,8 +586,6 @@ func run() error {
 
 	// --------------------------------------------------
 	// 18. OBS Event Dispatcher
-	//
-	// เป็น consumer เดียวของ IncomingEvents
 	// --------------------------------------------------
 
 	go func() {
@@ -584,6 +617,12 @@ func run() error {
 	)
 
 	printLog(
+		"Audio sample watchdog stall=%s recovery=%s",
+		sampleStallDuration,
+		sampleRecoveryDuration,
+	)
+
+	printLog(
 		"Heartbeat machine=%s interval=%s",
 		cfg.Agent.MachineID,
 		heartbeatInterval,
@@ -603,7 +642,22 @@ func run() error {
 	defer windowTicker.Stop()
 
 	// --------------------------------------------------
-	// 20. Heartbeat Ticker
+	// 20. Audio Sample Watchdog Ticker
+	//
+	// Watchdog ต้องมี ticker แยก
+	//
+	// เพราะตอน samples หาย
+	// case sample := <-samples
+	// จะไม่มีวันถูกเรียก
+	// --------------------------------------------------
+
+	sampleWatchdogTicker := time.NewTicker(
+		250 * time.Millisecond,
+	)
+	defer sampleWatchdogTicker.Stop()
+
+	// --------------------------------------------------
+	// 21. Heartbeat Ticker
 	// --------------------------------------------------
 
 	heartbeatTicker := time.NewTicker(
@@ -618,7 +672,7 @@ func run() error {
 	var latestSample audio.Sample
 
 	// --------------------------------------------------
-	// 21. Main Event Loop
+	// 22. Main Event Loop
 	// --------------------------------------------------
 
 	for {
@@ -659,6 +713,33 @@ func run() error {
 
 		case sample := <-samples:
 			latestSample = sample
+
+			// ------------------------------------------
+			// Audio Sample Watchdog
+			//
+			// ต้อง Observe ก่อน Detector อื่น
+			//
+			// Watchdog สนใจเพียง:
+			// "มี sample มาถึงหรือไม่"
+			//
+			// ไม่สนใจ:
+			// - muted
+			// - signal
+			// - dB
+			// ------------------------------------------
+
+			sampleTransition :=
+				sampleWatchdog.ObserveSample(
+					sample.Timestamp,
+				)
+
+			switch sampleTransition {
+
+			case detector.AudioSampleRecovered:
+				printLog(
+					"AUDIO SAMPLES RECOVERED",
+				)
+			}
 
 			// ------------------------------------------
 			// Mute Detector
@@ -781,8 +862,21 @@ func run() error {
 			)
 
 			// ------------------------------------------
-			// สำคัญ:
+			// Sync Monitoring Context → Sample Watchdog
 			//
+			// STREAMING:
+			// เริ่มจับเวลารอ sample
+			//
+			// STOPPED:
+			// reset watchdog
+			// ------------------------------------------
+
+			sampleWatchdog.SetMonitoring(
+				monitoringContext.MonitoringEnabled(),
+				streamEvent.Timestamp,
+			)
+
+			// ------------------------------------------
 			// ถ้า Detector มีปัญหาตั้งแต่ก่อน Live
 			// เมื่อ Stream กลายเป็น STREAMING
 			// Incident จะถูกเปิดตรงนี้
@@ -791,6 +885,25 @@ func run() error {
 			reconcileIncidents(
 				streamEvent.Timestamp,
 			)
+
+		// ==============================================
+		// Audio Sample Watchdog Tick
+		// ==============================================
+
+		case watchdogAt := <-sampleWatchdogTicker.C:
+			transition :=
+				sampleWatchdog.Check(
+					watchdogAt,
+				)
+
+			switch transition {
+
+			case detector.AudioSampleBecameStalled:
+				printLog(
+					"AUDIO SAMPLE STALLED no samples for %s",
+					sampleStallDuration,
+				)
+			}
 
 		// ==============================================
 		// Low Level Window Tick
@@ -844,12 +957,16 @@ func run() error {
 
 			// ------------------------------------------
 			// Terminal Status
+			//
+			// เพิ่ม sample_state เพื่อดู Watchdog
+			// ระหว่างทดลอง
 			// ------------------------------------------
 
 			if window.SampleCount == 0 {
 				printLog(
-					"%s no audio samples signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
+					"%s no audio samples sample_state=%s signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 					cfg.OBS.AudioInput,
+					sampleWatchdog.State(),
 					signalLossDetector.State(),
 					lowLevelDetector.State(),
 					muteDetector.State(),
@@ -862,10 +979,11 @@ func run() error {
 
 			if window.UsableSampleCount == 0 {
 				printLog(
-					"%s no usable level signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
+					"%s no usable level signal=%t muted=%t sample_state=%s signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 					cfg.OBS.AudioInput,
 					latestSample.SignalPresent,
 					latestSample.Muted,
+					sampleWatchdog.State(),
 					signalLossDetector.State(),
 					lowLevelDetector.State(),
 					muteDetector.State(),
@@ -877,11 +995,12 @@ func run() error {
 			}
 
 			printLog(
-				"%s level=%.1f dB signal=%t muted=%t signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
+				"%s level=%.1f dB signal=%t muted=%t sample_state=%s signal_state=%s level_state=%s mute_state=%s routing_state=%s stream_state=%s",
 				cfg.OBS.AudioInput,
 				window.MaxDB,
 				latestSample.SignalPresent,
 				latestSample.Muted,
+				sampleWatchdog.State(),
 				signalLossDetector.State(),
 				lowLevelDetector.State(),
 				muteDetector.State(),
@@ -907,6 +1026,10 @@ func run() error {
 					err,
 				)
 			}
+
+		// ==============================================
+		// Async Reporter Errors
+		// ==============================================
 
 		case err := <-reporterErrors:
 			printLog(
