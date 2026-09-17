@@ -7,6 +7,7 @@ type AudioHealth struct {
 	LevelState   string `json:"level_state"`
 	MuteState    string `json:"mute_state"`
 	RoutingState string `json:"routing_state"`
+	SampleState  string `json:"sample_state"`
 }
 
 type Heartbeat struct {

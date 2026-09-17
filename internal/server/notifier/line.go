@@ -170,7 +170,7 @@ func buildIncidentMessage(
 			)
 
 		case "RESOLVED":
-			recoveredAt := event.OccurredAt.
+			resolvedAt := event.OccurredAt.
 				In(location).
 				Format("02/01/2006 15:04:05")
 
@@ -188,7 +188,7 @@ func buildIncidentMessage(
 				duration.Round(
 					time.Second,
 				),
-				recoveredAt,
+				resolvedAt,
 			)
 		}
 	}
@@ -221,6 +221,42 @@ func buildIncidentMessage(
 		duration := time.Duration(
 			valueOrZero(event.DurationMS),
 		) * time.Millisecond
+
+		// ------------------------------------------
+		// Monitoring ถูกหยุด
+		//
+		// Incident จบเพราะ Stop Streaming
+		// ไม่ใช่เพราะ Audio recover
+		// ------------------------------------------
+
+		if event.ResolutionReason != nil &&
+			*event.ResolutionReason == "MONITORING_STOPPED" {
+
+			return fmt.Sprintf(
+				"ℹ️ Live Audio Monitoring Ended\n\n"+
+					"เครื่อง: %s\n"+
+					"ปัญหา: %s\n"+
+					"สถานะ: ปิด Incident เนื่องจากหยุด Streaming\n"+
+					"ระยะเวลา: %s\n"+
+					"เวลาสิ้นสุด: %s",
+				event.MachineID,
+				incidentDisplayName(
+					event.IncidentType,
+				),
+				duration.Round(
+					time.Second,
+				),
+				resolvedAt,
+			)
+		}
+
+		// ------------------------------------------
+		// Recover จริง
+		//
+		// เช่น:
+		// RECOVERED
+		// SAMPLES_RESUMED
+		// ------------------------------------------
 
 		return fmt.Sprintf(
 			"✅ Live Audio Recovered\n\n"+
@@ -263,6 +299,9 @@ func incidentDisplayName(
 
 	case "ROUTING_INVALID":
 		return "Audio Track Routing ผิด (ROUTING_INVALID)"
+
+	case "AUDIO_SAMPLE_STALLED":
+		return "ระบบไม่ได้รับข้อมูล Audio จาก OBS"
 
 	default:
 		return incidentType

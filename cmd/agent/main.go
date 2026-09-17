@@ -404,6 +404,9 @@ func run() error {
 
 			RoutingInvalid: trackRoutingDetector.State() ==
 				detector.TrackRoutingStateInvalid,
+
+			SampleStalled: sampleWatchdog.State() ==
+				detector.AudioSampleStalled,
 		}
 	}
 
@@ -459,6 +462,10 @@ func run() error {
 
 				RoutingState: string(
 					trackRoutingDetector.State(),
+				),
+
+				SampleState: string(
+					sampleWatchdog.State(),
 				),
 			},
 
@@ -886,9 +893,9 @@ func run() error {
 				streamEvent.Timestamp,
 			)
 
-		// ==============================================
-		// Audio Sample Watchdog Tick
-		// ==============================================
+			// ==============================================
+			// Audio Sample Watchdog Tick
+			// ==============================================
 
 		case watchdogAt := <-sampleWatchdogTicker.C:
 			transition :=
@@ -903,8 +910,26 @@ func run() error {
 					"AUDIO SAMPLE STALLED no samples for %s",
 					sampleStallDuration,
 				)
-			}
 
+				// ------------------------------------------
+				// Watchdog เปลี่ยน:
+				//
+				// HEALTHY
+				//    ↓
+				// STALLED
+				//
+				// currentHealth() ตอนนี้จะให้:
+				//
+				// SampleStalled=true
+				//
+				// จึงต้องบอก IncidentManager
+				// ให้ reconcile ทันที
+				// ------------------------------------------
+
+				reconcileIncidents(
+					watchdogAt,
+				)
+			}
 		// ==============================================
 		// Low Level Window Tick
 		// ==============================================

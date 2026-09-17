@@ -5,10 +5,11 @@ import "time"
 type Type string
 
 const (
-	TypeAudioTooLow    Type = "AUDIO_TOO_LOW"
-	TypeMuted          Type = "AUDIO_MUTED"
-	TypeSignalLost     Type = "SIGNAL_LOST"
-	TypeRoutingInvalid Type = "ROUTING_INVALID"
+	TypeAudioTooLow        Type = "AUDIO_TOO_LOW"
+	TypeMuted              Type = "AUDIO_MUTED"
+	TypeSignalLost         Type = "SIGNAL_LOST"
+	TypeRoutingInvalid     Type = "ROUTING_INVALID"
+	TypeAudioSampleStalled Type = "AUDIO_SAMPLE_STALLED"
 )
 
 type EventType string
@@ -23,6 +24,12 @@ type ResolutionReason string
 const (
 	ResolutionRecovered         ResolutionReason = "RECOVERED"
 	ResolutionMonitoringStopped ResolutionReason = "MONITORING_STOPPED"
+
+	// ใช้เฉพาะ AUDIO_SAMPLE_STALLED
+	//
+	// เพื่อบอกให้ชัดว่า Incident จบเพราะ
+	// audio samples กลับมาไหลอีกครั้ง
+	ResolutionSamplesResumed ResolutionReason = "SAMPLES_RESUMED"
 )
 
 type HealthSnapshot struct {
@@ -30,6 +37,9 @@ type HealthSnapshot struct {
 	Muted          bool
 	SignalLost     bool
 	RoutingInvalid bool
+
+	// Audio Sample Watchdog
+	SampleStalled bool
 }
 
 type Event struct {
@@ -38,7 +48,8 @@ type Event struct {
 
 	StartedAt  time.Time
 	OccurredAt time.Time
-	Duration   time.Duration
+
+	Duration time.Duration
 
 	ResolutionReason ResolutionReason
 }
@@ -53,7 +64,9 @@ type Manager struct {
 
 func NewManager() *Manager {
 	return &Manager{
-		active: make(map[Type]activeIncident),
+		active: make(
+			map[Type]activeIncident,
+		),
 	}
 }
 
@@ -94,21 +107,25 @@ func (m *Manager) Reconcile(
 		active, exists := m.active[incidentType]
 
 		// ==============================================
-		// ปัญหาเกิดขึ้น แต่ยังไม่มี Incident
+		// ปัญหาเกิดขึ้น
+		// แต่ยังไม่มี Incident เปิดอยู่
 		// ==============================================
 
 		if unhealthy && !exists {
-			m.active[incidentType] = activeIncident{
-				StartedAt: at,
-			}
+			m.active[incidentType] =
+				activeIncident{
+					StartedAt: at,
+				}
 
 			events = append(
 				events,
 				Event{
-					EventType:    EventOpened,
+					EventType: EventOpened,
+
 					IncidentType: incidentType,
-					StartedAt:    at,
-					OccurredAt:   at,
+
+					StartedAt:  at,
+					OccurredAt: at,
 				},
 			)
 
@@ -116,7 +133,8 @@ func (m *Manager) Reconcile(
 		}
 
 		// ==============================================
-		// ปัญหาหายแล้ว และมี Incident เปิดอยู่
+		// ปัญหาหายแล้ว
+		// และมี Incident เปิดอยู่
 		// ==============================================
 
 		if !unhealthy && exists {
@@ -128,12 +146,21 @@ func (m *Manager) Reconcile(
 			events = append(
 				events,
 				Event{
-					EventType:        EventResolved,
-					IncidentType:     incidentType,
-					StartedAt:        active.StartedAt,
-					OccurredAt:       at,
-					Duration:         at.Sub(active.StartedAt),
-					ResolutionReason: ResolutionRecovered,
+					EventType: EventResolved,
+
+					IncidentType: incidentType,
+
+					StartedAt: active.StartedAt,
+
+					OccurredAt: at,
+
+					Duration: at.Sub(
+						active.StartedAt,
+					),
+
+					ResolutionReason: recoveryReason(
+						incidentType,
+					),
 				},
 			)
 		}
@@ -150,6 +177,7 @@ func (m *Manager) closeAll(
 
 	for _, incidentType := range orderedIncidentTypes {
 		active, exists := m.active[incidentType]
+
 		if !exists {
 			continue
 		}
@@ -162,11 +190,18 @@ func (m *Manager) closeAll(
 		events = append(
 			events,
 			Event{
-				EventType:        EventResolved,
-				IncidentType:     incidentType,
-				StartedAt:        active.StartedAt,
-				OccurredAt:       at,
-				Duration:         at.Sub(active.StartedAt),
+				EventType: EventResolved,
+
+				IncidentType: incidentType,
+
+				StartedAt: active.StartedAt,
+
+				OccurredAt: at,
+
+				Duration: at.Sub(
+					active.StartedAt,
+				),
+
 				ResolutionReason: reason,
 			},
 		)
@@ -192,8 +227,37 @@ func (s HealthSnapshot) isActive(
 	case TypeRoutingInvalid:
 		return s.RoutingInvalid
 
+	case TypeAudioSampleStalled:
+		return s.SampleStalled
+
 	default:
 		return false
+	}
+}
+
+// --------------------------------------------------
+// Resolution reason เมื่อ Detector recover
+//
+// Detector เดิม:
+//     RECOVERED
+//
+// Audio Sample Watchdog:
+//     SAMPLES_RESUMED
+//
+// แต่ถ้า Monitoring ถูก Stop
+// closeAll() จะใช้ MONITORING_STOPPED แทน
+// --------------------------------------------------
+
+func recoveryReason(
+	incidentType Type,
+) ResolutionReason {
+	switch incidentType {
+
+	case TypeAudioSampleStalled:
+		return ResolutionSamplesResumed
+
+	default:
+		return ResolutionRecovered
 	}
 }
 
@@ -202,10 +266,11 @@ var orderedIncidentTypes = []Type{
 	TypeMuted,
 	TypeAudioTooLow,
 	TypeRoutingInvalid,
+	TypeAudioSampleStalled,
 }
 
 func (m *Manager) ActiveTypes() []Type {
-	active := make(
+	activeTypes := make(
 		[]Type,
 		0,
 		len(m.active),
@@ -216,11 +281,11 @@ func (m *Manager) ActiveTypes() []Type {
 			continue
 		}
 
-		active = append(
-			active,
+		activeTypes = append(
+			activeTypes,
 			incidentType,
 		)
 	}
 
-	return active
+	return activeTypes
 }

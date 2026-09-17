@@ -37,6 +37,7 @@ func (r *MachineRepository) UpsertHeartbeat(
 			level_state,
 			mute_state,
 			routing_state,
+			sample_state,
 			updated_at
 		)
 		VALUES (
@@ -50,6 +51,7 @@ func (r *MachineRepository) UpsertHeartbeat(
 			$7,
 			$8,
 			$9,
+			$10,
 			NOW()
 		)
 		ON CONFLICT (machine_id)
@@ -63,6 +65,7 @@ func (r *MachineRepository) UpsertHeartbeat(
 			level_state = EXCLUDED.level_state,
 			mute_state = EXCLUDED.mute_state,
 			routing_state = EXCLUDED.routing_state,
+			sample_state = EXCLUDED.sample_state,
 			updated_at = NOW()
 	`
 
@@ -80,6 +83,7 @@ func (r *MachineRepository) UpsertHeartbeat(
 		heartbeat.Audio.LevelState,
 		heartbeat.Audio.MuteState,
 		heartbeat.Audio.RoutingState,
+		heartbeat.Audio.SampleState,
 	)
 	if err != nil {
 		return fmt.Errorf(

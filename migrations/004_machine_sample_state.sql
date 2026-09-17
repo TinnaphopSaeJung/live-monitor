@@ -1,0 +1,2 @@
+ALTER TABLE machines
+ADD COLUMN sample_state TEXT NOT NULL DEFAULT 'UNKNOWN';
