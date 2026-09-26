@@ -256,12 +256,34 @@ func main() {
 		),
 	)
 
+	mux.HandleFunc(
+		"GET /healthz",
+		func(
+			w http.ResponseWriter,
+			r *http.Request,
+		) {
+			w.WriteHeader(
+				http.StatusOK,
+			)
+
+			_, _ = w.Write(
+				[]byte("ok"),
+			)
+		},
+	)
+
 	// --------------------------------------------------
 	// 11. HTTP Server
 	// --------------------------------------------------
 
+	port := os.Getenv("PORT")
+
+	if port == "" {
+		port = "8080"
+	}
+
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + port,
 		Handler: mux,
 
 		ReadHeaderTimeout: 5 * time.Second,
@@ -270,8 +292,9 @@ func main() {
 		IdleTimeout:       30 * time.Second,
 	}
 
-	log.Println(
-		"Backend listening on :8080",
+	log.Printf(
+		"Backend listening on :%s",
+		port,
 	)
 
 	// --------------------------------------------------
