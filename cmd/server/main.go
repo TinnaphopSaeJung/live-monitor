@@ -12,6 +12,7 @@ import (
 
 	"live-monitor/internal/contracts"
 	"live-monitor/internal/server/database"
+	serverhandler "live-monitor/internal/server/handler"
 	servermonitor "live-monitor/internal/server/monitor"
 	"live-monitor/internal/server/notifier"
 	"live-monitor/internal/server/repository"
@@ -48,6 +49,16 @@ func main() {
 	if lineChannelAccessToken == "" {
 		log.Fatal(
 			"LINE_CHANNEL_ACCESS_TOKEN environment variable is required",
+		)
+	}
+
+	lineChannelSecret := os.Getenv(
+		"LINE_CHANNEL_SECRET",
+	)
+
+	if lineChannelSecret == "" {
+		log.Fatal(
+			"LINE_CHANNEL_SECRET environment variable is required",
 		)
 	}
 
@@ -117,6 +128,15 @@ func main() {
 
 	log.Println(
 		"LINE notifier configured",
+	)
+
+	lineWebhookHandler :=
+		serverhandler.NewLINEWebhookHandler(
+			lineChannelSecret,
+		)
+
+	log.Println(
+		"LINE webhook handler configured",
 	)
 
 	// --------------------------------------------------
@@ -229,6 +249,11 @@ func main() {
 				machineRepository,
 			),
 		),
+	)
+
+	mux.Handle(
+		"POST /webhooks/line",
+		lineWebhookHandler,
 	)
 
 	// --------------------------------------------------
